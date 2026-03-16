@@ -1,0 +1,25 @@
+{
+  "name": "discord-rc",
+  "version": "1.0.0",
+  "description": "Discord Remote Control for Claude Code",
+  "type": "module",
+  "bin": {
+    "discord-rc": "dist/cli.js",
+    "discord-cmd": "dist/discord-cmd.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/rc.js"
+  },
+  "dependencies": {
+    "@clack/prompts": "^1.1.0",
+    "chokidar": "^4.0.3",
+    "discord.js": "^14.18.0",
+    "node-pty": "^1.0.0",
+    "picocolors": "^1.1.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.13.10",
+    "typescript": "^5.8.2"
+  }
+}

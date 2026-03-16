@@ -1,0 +1,8 @@
+node_modules/
+dist/
+*.tgz
+package/
+bun.lockb
+package-lock.json
+.env
+RESEARCH.md
