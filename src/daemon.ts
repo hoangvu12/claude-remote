@@ -4,7 +4,7 @@ import fs from "node:fs";
 import { readFile, open } from "node:fs/promises";
 import path from "node:path";
 import { parseJSONLString, processAssistantBlocks, processUserBlocks, processNonConversation, walkCurrentBranch } from "./jsonl-parser.js";
-import { renderMessage, renderBatch, renderToolUseEmbed, renderToolUseEmbedWithStatus, renderToolResultThreadMessages, renderPermissionPrompt } from "./discord-renderer.js";
+import { renderMessage, renderBatch, renderToolResultThreadMessages, renderPermissionPrompt } from "./discord-renderer.js";
 import { resolveJSONLPath, truncate, ID_PREFIX, CONFIG_DIR } from "./utils.js";
 import type { JSONLMessage, ProcessedMessage, DaemonToParent, SessionInfoMessage } from "./types.js";
 
@@ -25,11 +25,11 @@ let resolvedToolUseIds = new Set<string>();
 let discordOriginMessages = new Set<string>();
 let knownUuids = new Set<string>(); // all UUIDs we've seen — for rewind detection
 let currentPermissionMode: string | null = null;
+let thinkingMessage: Message | null = null;
 
-// Thread tracking: toolUseId → { thread, parentMessage, toolInfo }
+// Thread tracking: toolUseId → { thread, toolInfo }
 const toolUseThreads = new Map<string, {
   thread: ThreadChannel;
-  message: Message;
   toolName: string;
   content: string;
 }>();
@@ -56,6 +56,17 @@ async function rateLimitedSend(ch: TextChannel | ThreadChannel, payload: Message
     console.error("[daemon] Failed to send Discord message:", err);
     return null;
   }
+}
+
+async function showThinking() {
+  if (!channel || thinkingMessage) return;
+  thinkingMessage = await rateLimitedSend(channel, { content: "💭 **Thinking…**" });
+}
+
+async function clearThinking() {
+  if (!thinkingMessage) return;
+  try { await thinkingMessage.delete(); } catch { /* already gone */ }
+  thinkingMessage = null;
 }
 
 function dedupKey(pm: ProcessedMessage): string {
@@ -289,7 +300,6 @@ function isPassiveToolUse(pm: ProcessedMessage): boolean {
 
 // Track the current open passive tool group for retroactive merging
 let activePassiveGroup: {
-  message: Message;
   thread: ThreadChannel;
   counts: Map<string, number>;
   toolUseIds: string[];
@@ -319,14 +329,36 @@ async function closePassiveGroup() {
   try { await g.thread.setArchived(true); } catch { /* best effort */ }
 }
 
+let flushPromise: Promise<void> = Promise.resolve();
+
 async function flushBatch() {
   batchTimer = null;
+  if (!channel || pendingBatch.length === 0) return;
+  // Serialize flushes to prevent out-of-order messages
+  flushPromise = flushPromise.then(_flushBatch);
+}
+
+async function _flushBatch() {
   if (!channel || pendingBatch.length === 0) return;
 
   const batch = pendingBatch;
   pendingBatch = [];
 
   for (const pm of batch) {
+    // Show thinking indicator after user prompt
+    if (pm.type === "user-prompt") {
+      for (const payload of renderMessage(pm)) {
+        await rateLimitedSend(channel!, payload);
+      }
+      await showThinking();
+      continue;
+    }
+
+    // Clear thinking on first assistant response
+    if (pm.type === "assistant-text" || pm.type === "tool-use") {
+      await clearThinking();
+    }
+
     // Passive tool-use: merge into active group or start new one
     if (isPassiveToolUse(pm)) {
       await handlePassiveToolUse(pm);
@@ -363,6 +395,73 @@ async function flushBatch() {
   }
 }
 
+/**
+ * Tokenize a line into words and separators for word-level diffing.
+ * E.g. "foo(bar, baz)" → ["foo", "(", "bar", ", ", "baz", ")"]
+ */
+function tokenize(line: string): string[] {
+  return line.match(/\w+|\s+|[^\w\s]+/g) || [];
+}
+
+/**
+ * Simple LCS on token arrays — returns the set of matched indices in each array.
+ */
+function lcsTokens(a: string[], b: string[]): [Set<number>, Set<number>] {
+  const m = a.length, n = b.length;
+  // Build LCS table
+  const dp: number[][] = Array.from({ length: m + 1 }, () => Array(n + 1).fill(0));
+  for (let i = m - 1; i >= 0; i--) {
+    for (let j = n - 1; j >= 0; j--) {
+      dp[i][j] = a[i] === b[j] ? dp[i + 1][j + 1] + 1 : Math.max(dp[i + 1][j], dp[i][j + 1]);
+    }
+  }
+  // Backtrack to find matched indices
+  const matchedA = new Set<number>();
+  const matchedB = new Set<number>();
+  let i = 0, j = 0;
+  while (i < m && j < n) {
+    if (a[i] === b[j]) { matchedA.add(i); matchedB.add(j); i++; j++; }
+    else if (dp[i + 1][j] >= dp[i][j + 1]) i++;
+    else j++;
+  }
+  return [matchedA, matchedB];
+}
+
+/**
+ * Word-level diff highlighting between two lines.
+ * Returns ANSI-formatted strings with only changed tokens highlighted.
+ */
+function highlightLineDiff(oldLine: string, newLine: string): [string, string] {
+  const oldToks = tokenize(oldLine);
+  const newToks = tokenize(newLine);
+  const [matchedOld, matchedNew] = lcsTokens(oldToks, newToks);
+
+  // If most tokens changed (>60%), skip highlighting
+  let oldChanged = 0, oldTotal = 0, newChanged = 0, newTotal = 0;
+  for (let i = 0; i < oldToks.length; i++) {
+    if (oldToks[i].trim()) { oldTotal++; if (!matchedOld.has(i)) oldChanged++; }
+  }
+  for (let i = 0; i < newToks.length; i++) {
+    if (newToks[i].trim()) { newTotal++; if (!matchedNew.has(i)) newChanged++; }
+  }
+  if (oldTotal > 0 && oldChanged / oldTotal > 0.6) return [oldLine, newLine];
+  if (newTotal > 0 && newChanged / newTotal > 0.6) return [oldLine, newLine];
+
+  // Build highlighted strings — only changed (unmatched) tokens get bold+underline
+  let oldHl = "";
+  for (let i = 0; i < oldToks.length; i++) {
+    if (matchedOld.has(i)) oldHl += oldToks[i];
+    else oldHl += `\u001b[1;4;31m${oldToks[i]}\u001b[0m\u001b[31m`;
+  }
+  let newHl = "";
+  for (let i = 0; i < newToks.length; i++) {
+    if (matchedNew.has(i)) newHl += newToks[i];
+    else newHl += `\u001b[1;4;32m${newToks[i]}\u001b[0m\u001b[32m`;
+  }
+
+  return [oldHl, newHl];
+}
+
 function formatToolInput(pm: ProcessedMessage): MessageCreateOptions[] {
   const input = pm.toolInput;
   const name = pm.toolName;
@@ -373,16 +472,14 @@ function formatToolInput(pm: ProcessedMessage): MessageCreateOptions[] {
     const newStr = String(input.new_string || "");
     const lines: string[] = [`**Edit** \`${filePath}\``];
     if (oldStr || newStr) {
-      lines.push("```diff");
-      // Build Claude Code-style diff: shared context lines unmarked, removed with -, added with +
+      lines.push("```ansi");
       const oldLines = oldStr.split("\n");
       const newLines = newStr.split("\n");
-      // Find common prefix
+      // Find common prefix/suffix lines
       let commonStart = 0;
       while (commonStart < oldLines.length && commonStart < newLines.length && oldLines[commonStart] === newLines[commonStart]) {
         commonStart++;
       }
-      // Find common suffix
       let commonEnd = 0;
       while (commonEnd < oldLines.length - commonStart && commonEnd < newLines.length - commonStart && oldLines[oldLines.length - 1 - commonEnd] === newLines[newLines.length - 1 - commonEnd]) {
         commonEnd++;
@@ -391,9 +488,21 @@ function formatToolInput(pm: ProcessedMessage): MessageCreateOptions[] {
       const addedLines = newLines.slice(commonStart, newLines.length - commonEnd);
       // Context before
       for (let i = 0; i < commonStart; i++) lines.push(`  ${oldLines[i]}`);
-      // Changed lines
-      for (const l of removedLines) lines.push(`- ${l}`);
-      for (const l of addedLines) lines.push(`+ ${l}`);
+      // Changed lines with word-level highlighting
+      for (let i = 0; i < Math.max(removedLines.length, addedLines.length); i++) {
+        const oldL = i < removedLines.length ? removedLines[i] : null;
+        const newL = i < addedLines.length ? addedLines[i] : null;
+        if (oldL !== null && newL !== null) {
+          // Pair exists — highlight the changed tokens
+          const [oldHl, newHl] = highlightLineDiff(oldL, newL);
+          lines.push(`\u001b[31m- ${oldHl}\u001b[0m`);
+          lines.push(`\u001b[32m+ ${newHl}\u001b[0m`);
+        } else if (oldL !== null) {
+          lines.push(`\u001b[31m- ${oldL}\u001b[0m`);
+        } else if (newL !== null) {
+          lines.push(`\u001b[32m+ ${newL}\u001b[0m`);
+        }
+      }
       // Context after
       for (let i = oldLines.length - commonEnd; i < oldLines.length; i++) lines.push(`  ${oldLines[i]}`);
       lines.push("```");
@@ -440,6 +549,13 @@ function formatToolInput(pm: ProcessedMessage): MessageCreateOptions[] {
   return [{ content: `**${name}** ${pm.content}` }];
 }
 
+async function createToolThread(name: string): Promise<ThreadChannel> {
+  return channel!.threads.create({
+    name: truncate(`⏳ ${name}`, 100),
+    autoArchiveDuration: 60,
+  });
+}
+
 async function handlePassiveToolUse(pm: ProcessedMessage) {
   if (!channel || !pm.toolUseId) return;
 
@@ -453,13 +569,12 @@ async function handlePassiveToolUse(pm: ProcessedMessage) {
 
     const summary = passiveGroupSummary(g.counts);
 
-    // Update thread name
-    try { await g.thread.setName(truncate(summary, 100)); } catch { /* rate limited */ }
+    // Update thread name with loading indicator
+    try { await g.thread.setName(truncate(`⏳ ${summary}`, 100)); } catch { /* best effort */ }
 
     // Map this tool to the shared thread
     toolUseThreads.set(pm.toolUseId, {
       thread: g.thread,
-      message: g.message,
       toolName: name,
       content: summary,
     });
@@ -476,20 +591,15 @@ async function handlePassiveToolUse(pm: ProcessedMessage) {
   const summary = passiveGroupSummary(counts);
 
   try {
-    const thread = await channel.threads.create({
-      name: truncate(summary, 100),
-      autoArchiveDuration: 60,
-    });
+    const thread = await createToolThread(summary);
 
     toolUseThreads.set(pm.toolUseId, {
       thread,
-      message: null!,
       toolName: name,
       content: summary,
     });
 
     activePassiveGroup = {
-      message: null!,
       thread,
       counts,
       toolUseIds: [pm.toolUseId],
@@ -506,20 +616,14 @@ async function handlePassiveToolUse(pm: ProcessedMessage) {
 async function handleToolUse(pm: ProcessedMessage) {
   if (!channel || !pm.toolUseId) return;
 
-  // Send a plain text starter message for the thread (not the embed)
-  const threadStarter = `🔧 **${pm.toolName}** ${pm.content}`;
-  const sent = await rateLimitedSend(channel, { content: threadStarter });
-  if (!sent) return;
-
   try {
-    const threadName = `${pm.toolName} — ${truncate(pm.content.replace(/`/g, ""), 80)}`.slice(0, 100);
-    const thread = await sent.startThread({ name: threadName, autoArchiveDuration: 60 });
+    const cleanContent = pm.content.replace(/`/g, "");
+    const thread = await createToolThread(`${pm.toolName} — ${cleanContent}`);
 
     toolUseThreads.set(pm.toolUseId, {
       thread,
-      message: sent,
       toolName: pm.toolName || "Unknown",
-      content: pm.content,
+      content: cleanContent,
     });
 
     // Post formatted tool input in thread
@@ -573,8 +677,8 @@ async function handleToolResult(pm: ProcessedMessage) {
     if (!sameThread) {
       try {
         const icon = isError ? "❌" : "✅";
-        await entry.message.edit({ content: `🔧 **${entry.toolName}** ${entry.content} ${icon}` });
-      } catch { /* message may be gone */ }
+        await entry.thread.setName(truncate(`${entry.toolName} — ${entry.content} ${icon}`, 100));
+      } catch { /* rate limited */ }
       try { await entry.thread.setArchived(true); } catch { /* best effort */ }
     }
   }
@@ -701,6 +805,7 @@ async function handleDiscordMessage(message: Message) {
   console.log(`[daemon] Discord input: ${text}`);
   discordOriginMessages.add(text);
   sendToParent({ type: "pty-write", text });
+  await showThinking();
 }
 
 // ── Interaction handler ──
