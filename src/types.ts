@@ -38,6 +38,7 @@ export interface JSONLMessage {
   timestamp: string;
   sessionId: string;
   subtype?: string;
+  permissionMode?: string;
   message?: {
     role: "assistant" | "user";
     content: ContentBlock[] | string;
@@ -65,6 +66,7 @@ export interface SessionInfoMessage {
   sessionId: string;
   projectDir: string;
   channelName?: string;
+  transcriptPath?: string;
 }
 
 export interface DaemonReadyMessage {
@@ -91,7 +93,14 @@ export interface PipeStatusMessage {
   type: "status";
 }
 
-export type PipeMessage = PipeEnableMessage | PipeDisableMessage | PipeStatusMessage;
+export interface PipeSessionRegisterMessage {
+  type: "session-register";
+  sessionId: string;
+  transcriptPath: string;
+  cwd?: string;
+}
+
+export type PipeMessage = PipeEnableMessage | PipeDisableMessage | PipeStatusMessage | PipeSessionRegisterMessage;
 
 // ── Processed message for Discord rendering ──
 
@@ -101,13 +110,8 @@ export type DiscordMessageType =
   | "tool-use"
   | "tool-result"
   | "tool-result-error"
-  | "permission-prompt"
   | "ask-user-question"
-  | "subagent-start"
-  | "subagent-complete"
-  | "mcp-progress"
   | "rewind"
-  | "compact"
   | "turn-duration"
   | "status";
 

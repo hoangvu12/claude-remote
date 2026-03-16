@@ -1,6 +1,6 @@
 import { readFile } from "node:fs/promises";
 import type { JSONLMessage, ContentBlock, ContentBlockToolUse, ProcessedMessage } from "./types.js";
-import { truncate, extractToolResultText, TOOL_RESULT_MAX } from "./utils.js";
+import { truncate, extractToolResultText } from "./utils.js";
 
 /**
  * Parse a JSONL file into an array of messages.
@@ -81,47 +81,22 @@ export function walkCurrentBranch(messages: JSONLMessage[]): JSONLMessage[] {
  * Process system/progress/internal message types.
  */
 export function processNonConversation(msg: JSONLMessage): ProcessedMessage | null {
-  if (
-    msg.type === "file-history-snapshot" ||
-    msg.type === "queue-operation" ||
-    msg.type === "last-prompt"
-  ) {
-    return null;
-  }
+  if (msg.type !== "system") return null;
 
-  if (msg.type === "system") {
-    if (msg.subtype === "compact_boundary") {
-      return { type: "compact", content: "📦 Context compacted", uuid: msg.uuid };
-    }
-    if (msg.subtype === "turn_duration") {
-      const data = msg.data || {};
-      const cost = {
-        duration: data.duration as string | undefined,
-        inputTokens: data.inputTokens as number | undefined,
-        outputTokens: data.outputTokens as number | undefined,
-        cost: data.cost as string | undefined,
-      };
-      const parts: string[] = [];
-      if (cost.duration) parts.push(`⏱ ${cost.duration}`);
-      if (cost.cost) parts.push(`💰 ${cost.cost}`);
-      if (cost.inputTokens) parts.push(`📥 ${cost.inputTokens} in`);
-      if (cost.outputTokens) parts.push(`📤 ${cost.outputTokens} out`);
-      return { type: "turn-duration", content: parts.join(" · ") || "Turn completed", uuid: msg.uuid, cost };
-    }
-    return null;
-  }
-
-  if (msg.type === "progress") {
+  if (msg.subtype === "turn_duration") {
     const data = msg.data || {};
-    if (data.type === "mcp_progress") {
-      const toolName = (data.tool as string) || "unknown";
-      const status = data.status as string;
-      if (status === "started") {
-        return { type: "mcp-progress", content: `🔌 Running \`${toolName}\`...`, uuid: msg.uuid };
-      }
-      return { type: "mcp-progress", content: `🔌 \`${toolName}\` completed`, uuid: msg.uuid };
-    }
-    return null; // agent_progress, bash_progress — skip
+    const cost = {
+      duration: data.duration as string | undefined,
+      inputTokens: data.inputTokens as number | undefined,
+      outputTokens: data.outputTokens as number | undefined,
+      cost: data.cost as string | undefined,
+    };
+    const parts: string[] = [];
+    if (cost.duration) parts.push(`⏱ ${cost.duration}`);
+    if (cost.cost) parts.push(`💰 ${cost.cost}`);
+    if (cost.inputTokens) parts.push(`📥 ${cost.inputTokens} in`);
+    if (cost.outputTokens) parts.push(`📤 ${cost.outputTokens} out`);
+    return { type: "turn-duration", content: parts.join(" · ") || "Turn completed", uuid: msg.uuid, cost };
   }
 
   return null;
@@ -216,13 +191,9 @@ export function processUserBlocks(msg: JSONLMessage): ProcessedMessage[] {
       // Skip internal/discord-cmd results
       if (isInternalContent(raw) || /Discord sync (enabled|disabled)/.test(raw)) continue;
 
-      const text = raw.length > TOOL_RESULT_MAX
-        ? raw.slice(0, TOOL_RESULT_MAX) + "\n... (truncated)"
-        : raw;
-
       results.push({
         type: block.is_error ? "tool-result-error" : "tool-result",
-        content: text,
+        content: raw,
         uuid: msg.uuid,
         toolUseId: block.tool_use_id,
       });

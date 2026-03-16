@@ -18,10 +18,6 @@ export const ID_PREFIX = {
   MODAL: "modal:",
 } as const;
 
-// ── Tool result truncation ──
-
-export const TOOL_RESULT_MAX = 1500;
-
 // ── Helpers ──
 
 export function encodeProjectPath(projectPath: string): string {
