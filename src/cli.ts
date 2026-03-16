@@ -27,7 +27,7 @@ function saveConfig(config: Config) {
 }
 
 function getClaudeSettingsPath(): string {
-  return path.join(os.homedir(), ".claude", "settings.local.json");
+  return path.join(os.homedir(), ".claude", "settings.json");
 }
 
 function getSkillDir(): string {
@@ -41,14 +41,20 @@ function getStatuslineCommand(): string {
 
 // ── Skill & statusline management ──
 
-function installSkillAndStatusline() {
-  // Install /discord skill
+function getHookCommand(scriptName: string): string {
+  const scriptPath = path.resolve(import.meta.dirname, `${scriptName}.js`);
+  return `node "${scriptPath}"`;
+}
+
+function installHooksAndStatusline() {
+  // Install /discord skill (uses Haiku for speed)
   const skillDir = getSkillDir();
   fs.mkdirSync(skillDir, { recursive: true });
 
   const skillContent = `---
 name: discord
 description: Toggle Discord remote control sync for this session
+model: haiku
 disable-model-invocation: true
 allowed-tools: Bash
 ---
@@ -64,7 +70,7 @@ Print the output to the user. Do not add any extra commentary.
 
   fs.writeFileSync(path.join(skillDir, "SKILL.md"), skillContent);
 
-  // Install statusline
+  // Install hooks + statusline into settings
   const settingsPath = getClaudeSettingsPath();
   let settings: Record<string, unknown> = {};
 
@@ -72,36 +78,46 @@ Print the output to the user. Do not add any extra commentary.
     settings = JSON.parse(fs.readFileSync(settingsPath, "utf-8"));
   } catch { /* start fresh */ }
 
+  // Statusline
   settings.statusLine = {
     type: "command",
     command: getStatuslineCommand(),
   };
 
-  // Clean up old hook if it exists from a previous install
-  const hooks = settings.hooks as Record<string, unknown> | undefined;
-  if (hooks && Array.isArray(hooks.UserPromptSubmit)) {
-    hooks.UserPromptSubmit = hooks.UserPromptSubmit.filter((entry: Record<string, unknown>) => {
-      const innerHooks = entry.hooks as Array<Record<string, string>> | undefined;
-      return !innerHooks?.some((h) => h.command?.includes("discord-hook"));
-    });
-    if ((hooks.UserPromptSubmit as unknown[]).length === 0) {
-      delete hooks.UserPromptSubmit;
-    }
-    if (Object.keys(hooks).length === 0) {
-      delete settings.hooks;
+  // Build hooks — clean any existing discord-rc hooks first, then add ours
+  const hooks = (settings.hooks || {}) as Record<string, unknown[]>;
+
+  // Clean old discord-rc hooks from all event types
+  for (const eventType of ["UserPromptSubmit", "SessionStart"]) {
+    if (Array.isArray(hooks[eventType])) {
+      hooks[eventType] = hooks[eventType].filter((entry: unknown) => {
+        const e = entry as Record<string, unknown>;
+        const innerHooks = e.hooks as Array<Record<string, string>> | undefined;
+        return !innerHooks?.some((h) => h.command?.includes("discord-hook") || h.command?.includes("session-hook"));
+      });
+      if (hooks[eventType].length === 0) delete hooks[eventType];
     }
   }
+
+  // Add SessionStart hook — registers session info with rc.ts
+  if (!hooks.SessionStart) hooks.SessionStart = [];
+  hooks.SessionStart.push({
+    matcher: "",
+    hooks: [{ type: "command", command: getHookCommand("session-hook"), timeout: 5000 }],
+  });
+
+  settings.hooks = hooks;
 
   fs.mkdirSync(path.dirname(settingsPath), { recursive: true });
   fs.writeFileSync(settingsPath, JSON.stringify(settings, null, 2) + "\n");
 }
 
-function uninstallSkillAndStatusline() {
-  // Remove skill
+function uninstallHooksAndStatusline() {
+  // Remove skill (legacy)
   const skillDir = getSkillDir();
   fs.rmSync(skillDir, { recursive: true, force: true });
 
-  // Remove statusline
+  // Remove hooks + statusline from settings
   const settingsPath = getClaudeSettingsPath();
   let settings: Record<string, unknown>;
   try {
@@ -110,9 +126,26 @@ function uninstallSkillAndStatusline() {
     return;
   }
 
+  // Remove statusline
   const statusLine = settings.statusLine as Record<string, string> | undefined;
   if (statusLine?.command?.includes("statusline")) {
     delete settings.statusLine;
+  }
+
+  // Remove discord-rc hooks
+  const hooks = settings.hooks as Record<string, unknown[]> | undefined;
+  if (hooks) {
+    for (const eventType of ["UserPromptSubmit", "SessionStart"]) {
+      if (Array.isArray(hooks[eventType])) {
+        hooks[eventType] = hooks[eventType].filter((entry: unknown) => {
+          const e = entry as Record<string, unknown>;
+          const innerHooks = e.hooks as Array<Record<string, string>> | undefined;
+          return !innerHooks?.some((h) => h.command?.includes("discord-hook") || h.command?.includes("session-hook"));
+        });
+        if (hooks[eventType].length === 0) delete hooks[eventType];
+      }
+    }
+    if (Object.keys(hooks).length === 0) delete settings.hooks;
   }
 
   fs.writeFileSync(settingsPath, JSON.stringify(settings, null, 2) + "\n");
@@ -398,11 +431,11 @@ async function setup() {
       },
     },
     {
-      title: "Installing /discord command & statusline",
+      title: "Installing /discord skill, hooks & statusline",
       task: async (message) => {
-        message("Creating skill & patching settings...");
-        installSkillAndStatusline();
-        return "/discord command & statusline installed";
+        message("Configuring skill, hooks & statusline...");
+        installHooksAndStatusline();
+        return "/discord skill, SessionStart hook & statusline installed";
       },
     },
   ]);
@@ -472,10 +505,10 @@ async function uninstall() {
 
   await p.tasks([
     {
-      title: "Removing /discord command & statusline",
+      title: "Removing /discord skill, hooks & statusline",
       task: async () => {
-        uninstallSkillAndStatusline();
-        return "/discord command & statusline removed";
+        uninstallHooksAndStatusline();
+        return "Skill, hooks & statusline removed";
       },
     },
     {
