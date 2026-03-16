@@ -30,8 +30,9 @@ export function encodeProjectPath(projectPath: string): string {
     .replace(/ /g, "-");     // spaces → dashes
 }
 
-export function truncate(str: string, max: number): string {
-  return str.length > max ? str.slice(0, max) + "…" : str;
+export function truncate(text: string, maxLen: number, suffix = "…"): string {
+  if (text.length <= maxLen) return text;
+  return text.slice(0, maxLen - suffix.length) + suffix;
 }
 
 export function resolveJSONLPath(sessionId: string, cwd: string): string {
