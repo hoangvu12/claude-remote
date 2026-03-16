@@ -13,7 +13,6 @@ import { truncate, ID_PREFIX } from "./utils.js";
 
 const COLOR = {
   USER: 0x5865f2,       // blurple — user prompts
-  CLAUDE: 0x3498db,     // blue — claude text
   TOOL: 0x2c2f33,       // dark gray — tool calls
   TOOL_OK: 0x2ecc71,    // green — success
   TOOL_ERR: 0xe74c3c,   // red — error
@@ -41,7 +40,6 @@ function splitContent(text: string, max = MAX_CONTENT): string[] {
   return chunks;
 }
 
-export { splitContent };
 
 // ── Single message renderer ──
 
@@ -56,14 +54,8 @@ export function renderMessage(msg: ProcessedMessage): MessageCreateOptions[] {
     }
 
     case "assistant-text": {
-      const chunks = splitContent(msg.content, MAX_EMBED_DESC);
-      return chunks.map((chunk, i) => {
-        const embed = new EmbedBuilder()
-          .setDescription(chunk)
-          .setColor(COLOR.CLAUDE);
-        if (i === 0) embed.setAuthor({ name: "Claude" });
-        return { embeds: [embed] };
-      });
+      const chunks = splitContent(msg.content);
+      return chunks.map((chunk) => ({ content: chunk }));
     }
 
     case "tool-use": {
@@ -142,23 +134,6 @@ export function renderMessage(msg: ProcessedMessage): MessageCreateOptions[] {
     default:
       return [];
   }
-}
-
-// ── Tool call embed builders (for thread-based rendering) ──
-
-/** Build the compact main-channel embed for a tool call */
-export function renderToolUseEmbed(msg: ProcessedMessage): EmbedBuilder {
-  return new EmbedBuilder()
-    .setDescription(`🔧 **${msg.toolName}** ${msg.content}`)
-    .setColor(COLOR.TOOL);
-}
-
-/** Update a tool-use embed with result status */
-export function renderToolUseEmbedWithStatus(msg: ProcessedMessage, success: boolean): EmbedBuilder {
-  const icon = success ? "✅" : "❌";
-  return new EmbedBuilder()
-    .setDescription(`🔧 **${msg.toolName}** ${msg.content} ${icon}`)
-    .setColor(success ? COLOR.TOOL : COLOR.TOOL_ERR);
 }
 
 /** Build thread messages for a tool result (splits long content) */
