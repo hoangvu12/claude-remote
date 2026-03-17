@@ -8,6 +8,7 @@ import {
   ModalBuilder,
   TextInputBuilder,
   TextInputStyle,
+  AttachmentBuilder,
   Events,
   type TextChannel,
   type ThreadChannel,
@@ -23,6 +24,7 @@ import type {
   ProviderMessage,
   ProviderThread,
   ProviderInteraction,
+  UserAttachment,
 } from "../provider.js";
 import { ID_PREFIX } from "../utils.js";
 
@@ -35,7 +37,7 @@ export class DiscordProvider implements OutputProvider, ThreadCapable, InputCapa
   private messageTimes: number[] = [];
   private messageCache = new Map<string, Message>();
   private threadCache = new Map<string, ThreadChannel>();
-  private userMessageCb?: (text: string) => void;
+  private userMessageCb?: (text: string, attachments?: UserAttachment[]) => void;
   private interactionCb?: (interaction: ProviderInteraction) => void;
 
   constructor(
@@ -118,7 +120,7 @@ export class DiscordProvider implements OutputProvider, ThreadCapable, InputCapa
 
   // ── InputCapable ──
 
-  onUserMessage(cb: (text: string) => void): void {
+  onUserMessage(cb: (text: string, attachments?: UserAttachment[]) => void): void {
     this.userMessageCb = cb;
   }
 
@@ -145,8 +147,19 @@ export class DiscordProvider implements OutputProvider, ThreadCapable, InputCapa
     if (message.author.bot) return;
     if (message.channel.id !== this.channel.id) return;
     const text = message.content.trim();
-    if (!text) return;
-    this.userMessageCb?.(text);
+
+    // Collect image attachments
+    const IMAGE_EXTS = /\.(png|jpe?g|gif|webp|bmp|svg)$/i;
+    const attachments: UserAttachment[] = [];
+    for (const [, att] of message.attachments) {
+      const isImage = att.contentType?.startsWith("image/") || IMAGE_EXTS.test(att.name ?? "");
+      if (isImage) {
+        attachments.push({ url: att.url, filename: att.name ?? "image.png", contentType: att.contentType ?? "image/png" });
+      }
+    }
+
+    if (!text && attachments.length === 0) return;
+    this.userMessageCb?.(text, attachments.length > 0 ? attachments : undefined);
   }
 
   private async handleInteraction(interaction: import("discord.js").Interaction) {
@@ -223,6 +236,7 @@ export class DiscordProvider implements OutputProvider, ThreadCapable, InputCapa
       if (msg.embed.color !== undefined) embed.setColor(msg.embed.color);
       if (msg.embed.footer) embed.setFooter({ text: msg.embed.footer });
       if (msg.embed.author) embed.setAuthor({ name: msg.embed.author });
+      if (msg.embedImage) embed.setImage(msg.embedImage);
       payload.embeds = [embed];
     } else {
       payload.embeds = [];
@@ -263,6 +277,10 @@ export class DiscordProvider implements OutputProvider, ThreadCapable, InputCapa
     // Always set components — when empty, this clears existing buttons on update()
     {
       payload.components = components;
+    }
+
+    if (msg.files?.length) {
+      payload.files = msg.files.map((f) => new AttachmentBuilder(f.data, { name: f.name }));
     }
 
     return payload;

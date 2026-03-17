@@ -6,7 +6,7 @@ import path from "node:path";
 import os from "node:os";
 import { parseJSONLString, processAssistantBlocks, processUserBlocks, processNonConversation, walkCurrentBranch, getToolInputPreview } from "./jsonl-parser.js";
 import { renderBatch, COLOR } from "./discord-renderer.js";
-import { resolveJSONLPath, ID_PREFIX, CONFIG_DIR, capSet, truncate, extractToolResultText } from "./utils.js";
+import { resolveJSONLPath, ID_PREFIX, CONFIG_DIR, capSet, truncate, extractToolResultText, extractToolResultImages, mimeToExt } from "./utils.js";
 import type { JSONLMessage, ProcessedMessage, ContentBlock, ContentBlockToolUse, ContentBlockText, ContentBlockToolResult, DaemonToParent, SessionInfoMessage } from "./types.js";
 import { DiscordProvider } from "./providers/discord.js";
 import { createPipeline } from "./create-pipeline.js";
@@ -35,6 +35,7 @@ let ctx: SessionContext | null = null;
 let pipeline: HandlerPipeline | null = null;
 let provider: DiscordProvider | null = null;
 let activity: ActivityManager | null = null;
+const tempFiles = new Set<string>();
 
 // ── Batching ──
 
@@ -187,10 +188,38 @@ async function start() {
 
   // Wire up Discord input → PTY
   if (hasInput(provider)) {
-    provider.onUserMessage((text) => {
-      console.log(`[daemon] Discord input: ${text}`);
+    provider.onUserMessage(async (text, attachments) => {
+      console.log(`[daemon] Discord input: ${text}${attachments ? ` (+${attachments.length} images)` : ""}`);
+
+      // Download image attachments to temp files and build path references
+      let finalText = text;
+      if (attachments?.length) {
+        const paths: string[] = [];
+        for (const att of attachments) {
+          try {
+            const resp = await fetch(att.url);
+            const buf = Buffer.from(await resp.arrayBuffer());
+            const ext = att.filename.split(".").pop() || "png";
+            const tmpPath = path.join(os.tmpdir(), `discord-rc-${Date.now()}-${Math.random().toString(36).slice(2)}.${ext}`);
+            fs.writeFileSync(tmpPath, buf);
+            tempFiles.add(tmpPath);
+            paths.push(tmpPath);
+          } catch (err) {
+            console.error("[daemon] Failed to download attachment:", err);
+          }
+        }
+        if (paths.length > 0) {
+          const pathList = paths.map((p) => p.replace(/\\/g, "/")).join(" ");
+          finalText = finalText
+            ? `${finalText} (see attached image: ${pathList})`
+            : `Please look at this image: ${pathList}`;
+        }
+      }
+
+      if (!finalText) return;
+
       if (activity!.busy) {
-        const msg = activity!.enqueue(text);
+        const msg = activity!.enqueue(finalText);
         provider!.send({
           embed: {
             description: `📥 Queued #${msg.id} (${activity!.queue.length} in queue)\n>>> ${text.slice(0, 200)}`,
@@ -202,8 +231,8 @@ async function start() {
       }
       activity!.busy = true;
       activity!.resetIdleTimer();
-      ctx!.originMessages.add(text);
-      sendToParent({ type: "pty-write", text });
+      ctx!.originMessages.add(finalText);
+      sendToParent({ type: "pty-write", text: finalText });
       activity!.update("thinking", client);
     });
 
@@ -717,6 +746,7 @@ async function forwardAgentProgress(msg: JSONLMessage) {
       if (block.type === "tool_result") {
         const tb = block as ContentBlockToolResult;
         const resultText = extractToolResultText(tb.content).trim();
+        const images = extractToolResultImages(tb.content as Parameters<typeof extractToolResultImages>[0]);
         const isError = !!tb.is_error;
         const icon = isError ? "❌" : "✅";
         if (resultText && resultText !== "undefined") {
@@ -727,6 +757,18 @@ async function forwardAgentProgress(msg: JSONLMessage) {
           await ctx.provider.sendToThread(parentEntry.thread, {
             text: `${icon} *(no output)*`,
           });
+        }
+        // Forward images from tool results
+        if (images.length > 0) {
+          for (let i = 0; i < images.length; i++) {
+            const img = images[i];
+            const ext = mimeToExt(img.mediaType);
+            const buf = Buffer.from(img.data, "base64");
+            if (buf.length > 8 * 1024 * 1024) continue;
+            await ctx.provider.sendToThread(parentEntry.thread, {
+              files: [{ name: `image-${i + 1}.${ext}`, data: buf }],
+            });
+          }
         }
       }
     }
@@ -826,6 +868,11 @@ async function cleanup() {
   if (activity) activity.destroy();
   if (pipeline) pipeline.destroy();
   if (watcher) await watcher.close();
+  // Clean up temp image files
+  for (const f of tempFiles) {
+    try { fs.unlinkSync(f); } catch { /* may already be gone */ }
+  }
+  tempFiles.clear();
   if (provider) {
     try { await provider.send({ text: "🔴 **Discord sync disabled**" }); } catch { /* may be gone */ }
     await provider.destroy();
