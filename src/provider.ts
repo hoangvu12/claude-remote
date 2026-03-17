@@ -32,6 +32,9 @@ export interface OutgoingMessage {
     minValues?: number;
     maxValues?: number;
   };
+  files?: Array<{ name: string; data: Buffer }>;
+  /** Image URL to display inside the embed (e.g. attachment://image.png) */
+  embedImage?: string;
 }
 
 /** Interaction from a user (button click, select, modal) */
@@ -61,9 +64,15 @@ export interface ThreadCapable {
   archiveThread(thread: ProviderThread): Promise<void>;
 }
 
+export interface UserAttachment {
+  url: string;
+  filename: string;
+  contentType: string | null;
+}
+
 /** Optional: provider supports receiving user input */
 export interface InputCapable {
-  onUserMessage(cb: (text: string) => void): void;
+  onUserMessage(cb: (text: string, attachments?: UserAttachment[]) => void): void;
   onInteraction(cb: (interaction: ProviderInteraction) => void): void;
   respond(interaction: ProviderInteraction, msg: OutgoingMessage): Promise<void>;
 }

@@ -12,10 +12,19 @@ export interface ContentBlockToolUse {
   input: Record<string, unknown>;
 }
 
+export interface ContentBlockImage {
+  type: "image";
+  source: {
+    type: "base64";
+    media_type: string;
+    data: string;
+  };
+}
+
 export interface ContentBlockToolResult {
   type: "tool_result";
   tool_use_id: string;
-  content: string | ContentBlockText[];
+  content: string | (ContentBlockText | ContentBlockImage)[];
   is_error?: boolean;
 }
 
@@ -28,7 +37,8 @@ export type ContentBlock =
   | ContentBlockText
   | ContentBlockToolUse
   | ContentBlockToolResult
-  | ContentBlockThinking;
+  | ContentBlockThinking
+  | ContentBlockImage;
 
 export interface JSONLMessage {
   type: "assistant" | "user" | "system" | "progress" | "result" | "rate_limit_event" | "auth_status" | "tool_use_summary" | "tool_progress" | "prompt_suggestion" | "file-history-snapshot" | "queue-operation" | "last-prompt";
@@ -138,4 +148,5 @@ export interface ProcessedMessage {
   }>;
   isFromDiscord?: boolean;
   cost?: { duration?: string; inputTokens?: number; outputTokens?: number; cost?: string };
+  images?: Array<{ mediaType: string; data: string }>;
 }

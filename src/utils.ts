@@ -51,9 +51,32 @@ export function resolveJSONLPath(sessionId: string, cwd: string): string {
 export function extractToolResultText(content: string | Array<{ type: string; text?: string }>): string {
   if (typeof content === "string") return content;
   if (Array.isArray(content)) {
-    return content.map((b) => b.text || "").join("\n");
+    return content.filter((b) => b.type === "text").map((b) => b.text || "").join("\n");
   }
   return "";
+}
+
+/**
+ * Extract image content blocks from a tool_result.
+ */
+export function extractToolResultImages(
+  content: string | Array<{ type: string; source?: { type: string; media_type: string; data: string } }>,
+): Array<{ mediaType: string; data: string }> {
+  if (!Array.isArray(content)) return [];
+  return content
+    .filter((b) => b.type === "image" && b.source?.type === "base64")
+    .map((b) => ({ mediaType: b.source!.media_type, data: b.source!.data }));
+}
+
+/** Map a MIME type to a file extension */
+export function mimeToExt(mediaType: string): string {
+  const map: Record<string, string> = {
+    "image/png": "png",
+    "image/jpeg": "jpg",
+    "image/gif": "gif",
+    "image/webp": "webp",
+  };
+  return map[mediaType] || "png";
 }
 
 // ── Permission mode cycling (matches Claude Code's Shift+Tab order) ──
