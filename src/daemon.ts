@@ -607,10 +607,15 @@ async function handleFileChange(filePath: string) {
       if (msg.type === "system") {
         if (msg.subtype === "api_error") {
           const cause = (msg as unknown as Record<string, unknown>).cause as Record<string, unknown> | undefined;
-          const detail = cause?.code ? String(cause.code) : "unknown error";
+          const detail = cause?.message ? String(cause.message) : cause?.code ? String(cause.code) : "unknown error";
           await ctx.provider.send({
             embed: { description: `⚠️ **API error**: ${detail}`, color: COLOR.ERROR_RED },
           });
+          if (activity) {
+            activity.busy = false;
+            activity.update("idle");
+            setTimeout(() => activity!.tryDequeue(), 500);
+          }
         } else if (msg.subtype === "compact_boundary") {
           await ctx.provider.send({ text: "🗜️ **Context compacted**" });
         }
