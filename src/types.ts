@@ -59,6 +59,8 @@ export interface Config {
 export interface PtyWriteMessage {
   type: "pty-write";
   text: string;
+  /** If true, write text exactly as-is without appending \r */
+  raw?: boolean;
 }
 
 export interface SessionInfoMessage {
@@ -67,6 +69,7 @@ export interface SessionInfoMessage {
   projectDir: string;
   channelName?: string;
   transcriptPath?: string;
+  reuseChannelId?: string;
 }
 
 export interface DaemonReadyMessage {

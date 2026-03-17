@@ -16,6 +16,8 @@ export const ID_PREFIX = {
   ASK: "ask:",
   ASK_OTHER: "ask-other:",
   MODAL: "modal:",
+  PLAN: "plan:",
+  PLAN_FEEDBACK: "plan-feedback:",
 } as const;
 
 // ── Helpers ──

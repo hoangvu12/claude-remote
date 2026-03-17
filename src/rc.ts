@@ -20,6 +20,7 @@ let sessionId: string | null = null;
 let transcriptPath: string | null = null;
 let projectDir = process.cwd();
 let daemonWasEnabled = false;
+let lastChannelId: string | null = null;
 
 // ── Spawn Claude in PTY ──
 
@@ -170,8 +171,9 @@ function startDaemon(channelName?: string) {
 
   daemon.on("message", (msg: DaemonToParent) => {
     if (msg.type === "pty-write") {
-      proc.write(msg.text + "\r");
+      proc.write(msg.raw ? msg.text : msg.text + "\r");
     } else if (msg.type === "daemon-ready") {
+      lastChannelId = msg.channelId;
       setStatusFlag(true);
     }
   });
@@ -192,7 +194,7 @@ function startDaemon(channelName?: string) {
   setStatusFlag(true);
 
   // Pass transcript path directly if we have it from the hook
-  daemon.send({ type: "session-info", sessionId, projectDir, channelName, transcriptPath });
+  daemon.send({ type: "session-info", sessionId, projectDir, channelName, transcriptPath, reuseChannelId: lastChannelId || undefined });
 }
 
 function stopDaemon() {
