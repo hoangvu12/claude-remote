@@ -33,6 +33,11 @@ import { ID_PREFIX } from "../utils.js";
 const RATE_WINDOW = 5000;
 const RATE_LIMIT = 5;
 
+// ── Cache limits ──
+
+const MAX_MESSAGE_CACHE = 80;
+const MAX_THREAD_CACHE = 40;
+
 export class DiscordProvider implements OutputProvider, ThreadCapable, InputCapable {
   private messageTimes: number[] = [];
   private messageCache = new Map<string, Message>();
@@ -55,6 +60,7 @@ export class DiscordProvider implements OutputProvider, ThreadCapable, InputCapa
     const sent = await this.rateLimitedSend(this.channel, payload);
     if (!sent) return null;
     this.messageCache.set(sent.id, sent);
+    this.capCache(this.messageCache, MAX_MESSAGE_CACHE);
     return { id: sent.id };
   }
 
@@ -92,6 +98,7 @@ export class DiscordProvider implements OutputProvider, ThreadCapable, InputCapa
       autoArchiveDuration: 60,
     });
     this.threadCache.set(thread.id, thread);
+    this.capCache(this.threadCache, MAX_THREAD_CACHE);
     return { id: thread.id };
   }
 
@@ -102,6 +109,7 @@ export class DiscordProvider implements OutputProvider, ThreadCapable, InputCapa
     const sent = await this.rateLimitedSend(thread, payload);
     if (!sent) return null;
     this.messageCache.set(sent.id, sent);
+    this.capCache(this.messageCache, MAX_MESSAGE_CACHE);
     return { id: sent.id };
   }
 
@@ -217,6 +225,18 @@ export class DiscordProvider implements OutputProvider, ThreadCapable, InputCapa
       if (text) {
         this.interactionCb?.({ type: "modal-submit", customId: interaction.customId, text, ref: interaction });
       }
+    }
+  }
+
+  // ── Cache eviction ──
+
+  private capCache<K, V>(map: Map<K, V>, max: number) {
+    if (map.size <= max) return;
+    const excess = map.size - max;
+    const iter = map.keys();
+    for (let i = 0; i < excess; i++) {
+      const key = iter.next().value;
+      if (key !== undefined) map.delete(key);
     }
   }
 
