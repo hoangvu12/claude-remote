@@ -39,7 +39,7 @@ function getClaudeSettingsPath(): string {
 }
 
 function getSkillDir(): string {
-  return path.join(os.homedir(), ".claude", "skills", "discord");
+  return path.join(os.homedir(), ".claude", "skills", "remote");
 }
 
 function getStatuslineCommand(): string {
@@ -55,22 +55,26 @@ function getHookCommand(scriptName: string): string {
 }
 
 function installHooksAndStatusline() {
-  // Install /discord skill (uses Haiku for speed)
+  // Remove old /discord skill if it exists (migration from discord-rc)
+  const oldSkillDir = path.join(os.homedir(), ".claude", "skills", "discord");
+  fs.rmSync(oldSkillDir, { recursive: true, force: true });
+
+  // Install /remote skill (uses Haiku for speed)
   const skillDir = getSkillDir();
   fs.mkdirSync(skillDir, { recursive: true });
 
   const skillContent = `---
-name: discord
-description: Toggle Discord remote control sync for this session
+name: remote
+description: Toggle remote control sync for this session
 model: haiku
 disable-model-invocation: true
 allowed-tools: Bash
 ---
 
-Run the discord-cmd CLI to toggle/control remote sync. Pass through any arguments the user provided.
+Run the remote-cmd CLI to toggle/control remote sync. Pass through any arguments the user provided.
 
 \`\`\`bash
-discord-cmd $ARGUMENTS
+remote-cmd $ARGUMENTS
 \`\`\`
 
 Print the output to the user. Do not add any extra commentary.
@@ -121,9 +125,12 @@ Print the output to the user. Do not add any extra commentary.
 }
 
 function uninstallHooksAndStatusline() {
-  // Remove skill (legacy)
+  // Remove skill
   const skillDir = getSkillDir();
   fs.rmSync(skillDir, { recursive: true, force: true });
+  // Remove old /discord skill if it exists (migration from discord-rc)
+  const oldSkillDir = path.join(os.homedir(), ".claude", "skills", "discord");
+  fs.rmSync(oldSkillDir, { recursive: true, force: true });
 
   // Remove hooks + statusline from settings
   const settingsPath = getClaudeSettingsPath();
@@ -439,11 +446,11 @@ async function setup() {
       },
     },
     {
-      title: "Installing /discord skill, hooks & statusline",
+      title: "Installing /remote skill, hooks & statusline",
       task: async (message) => {
         message("Configuring skill, hooks & statusline...");
         installHooksAndStatusline();
-        return "/discord skill, SessionStart hook & statusline installed";
+        return "/remote skill, SessionStart hook & statusline installed";
       },
     },
   ]);
@@ -483,14 +490,14 @@ async function setup() {
   p.note(
     [
       `${pc.cyan(cmdName)}${" ".repeat(Math.max(1, 20 - cmdName.length))}Start Claude Code with RC support`,
-      `${pc.cyan("/discord on")}           Enable sync (inside a session)`,
-      `${pc.cyan("/discord off")}          Disable sync`,
+      `${pc.cyan("/remote on")}            Enable sync (inside a session)`,
+      `${pc.cyan("/remote off")}           Disable sync`,
       "",
       `Bot      ${pc.green(botUsername)}`,
       `Server   ${pc.green(guildName)}`,
       `Category ${pc.green(CATEGORY_NAME)}`,
       "",
-      pc.dim("Each /discord on creates a new channel under the category."),
+      pc.dim("Each /remote on creates a new channel under the category."),
     ].join("\n"),
     "Ready to go!"
   );
@@ -513,7 +520,7 @@ async function uninstall() {
 
   await p.tasks([
     {
-      title: "Removing /discord skill, hooks & statusline",
+      title: "Removing /remote skill, hooks & statusline",
       task: async () => {
         uninstallHooksAndStatusline();
         return "Skill, hooks & statusline removed";

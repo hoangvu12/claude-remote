@@ -16,6 +16,9 @@ const CLAUDE_BIN = "claude.exe";
 
 // ── State ──
 
+const cliArgs = process.argv.slice(2);
+const initialPermissionMode = cliArgs.includes("--dangerously-skip-permissions") ? "bypassPermissions" : "default";
+
 let daemon: ChildProcess | null = null;
 let sessionId: string | null = null;
 let transcriptPath: string | null = null;
@@ -203,7 +206,7 @@ function startDaemon(channelName?: string) {
   setStatusFlag(true);
 
   // Pass transcript path directly if we have it from the hook
-  daemon.send({ type: "session-info", sessionId, projectDir, channelName, transcriptPath, reuseChannelId: lastChannelId || undefined });
+  daemon.send({ type: "session-info", sessionId, projectDir, channelName, transcriptPath, reuseChannelId: lastChannelId || undefined, initialPermissionMode });
 }
 
 function stopDaemon() {

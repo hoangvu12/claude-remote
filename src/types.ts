@@ -85,6 +85,7 @@ export interface SessionInfoMessage {
   channelName?: string;
   transcriptPath?: string;
   reuseChannelId?: string;
+  initialPermissionMode?: string;
 }
 
 export interface DaemonReadyMessage {

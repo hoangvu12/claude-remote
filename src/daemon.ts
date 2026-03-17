@@ -53,6 +53,7 @@ function sendToParent(msg: DaemonToParent) {
 }
 
 let reuseChannelId: string | undefined;
+let initialPermissionMode = "default";
 
 process.on("message", (msg: SessionInfoMessage) => {
   if (msg.type === "session-info") {
@@ -60,6 +61,7 @@ process.on("message", (msg: SessionInfoMessage) => {
     projectDir = msg.projectDir;
     customChannelName = msg.channelName;
     reuseChannelId = msg.reuseChannelId;
+    if (msg.initialPermissionMode) initialPermissionMode = msg.initialPermissionMode;
     jsonlPath = msg.transcriptPath || resolveJSONLPath(sessionId, projectDir);
     console.log(`[daemon] Session: ${sessionId}`);
     console.log(`[daemon] JSONL: ${jsonlPath}`);
@@ -180,7 +182,7 @@ async function start() {
     sessionId,
     projectDir,
     provider,
-    permissionMode: null,
+    permissionMode: initialPermissionMode,
     resolvedToolUseIds: new Set<string>(),
     originMessages: new Set<string>(),
     sendToPty: (text: string) => sendToParent({ type: "pty-write", text }),

@@ -8,7 +8,7 @@ export interface SessionContext {
   sessionId: string;
   projectDir: string;
   provider: OutputProvider;
-  permissionMode: string | null;
+  permissionMode: string;
   resolvedToolUseIds: Set<string>;
   originMessages: Set<string>;
   sendToPty(text: string): void;

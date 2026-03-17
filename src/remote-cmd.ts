@@ -1,14 +1,14 @@
 #!/usr/bin/env node
 
 /**
- * Standalone CLI for /discord skill.
+ * Standalone CLI for /remote skill.
  * Called by Claude Code's Bash tool via the skill.
  *
  * Usage:
- *   discord-cmd                  → toggle
- *   discord-cmd on [name]        → enable, optional channel name
- *   discord-cmd off              → disable
- *   discord-cmd status           → print current state
+ *   remote-cmd                  → toggle
+ *   remote-cmd on [name]        → enable, optional channel name
+ *   remote-cmd off              → disable
+ *   remote-cmd status           → print current state
  */
 
 import { findPipe, sendPipeMessage } from "./pipe-client.js";

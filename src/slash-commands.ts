@@ -99,9 +99,14 @@ export async function setupSlashCommands(
         }
         const presses = modeShiftTabCount(current, target);
         const SHIFT_TAB = "\x1b[Z";
+        // Send each Shift+Tab with a delay so Claude Code has time to process each one
         for (let i = 0; i < presses; i++) {
+          if (i > 0) await new Promise((r) => setTimeout(r, 500));
           sendToParent({ type: "pty-write", text: SHIFT_TAB, raw: true });
         }
+        // Optimistically update tracked mode — JSONL won't reflect the change until next user message
+        const ctx = getCtx();
+        if (ctx) ctx.permissionMode = target;
         await cmd.reply({ content: `🔄 Switching to **${MODE_LABELS[target]}** (${presses} cycle${presses > 1 ? "s" : ""})`, ephemeral: true });
         break;
       }

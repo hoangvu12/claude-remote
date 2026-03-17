@@ -5,7 +5,7 @@
   "type": "module",
   "bin": {
     "claude-remote": "dist/cli.js",
-    "discord-cmd": "dist/discord-cmd.js"
+    "remote-cmd": "dist/remote-cmd.js"
   },
   "files": [
     "dist",
