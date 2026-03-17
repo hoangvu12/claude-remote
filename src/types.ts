@@ -44,6 +44,9 @@ export interface JSONLMessage {
     content: ContentBlock[] | string;
   };
   data?: Record<string, unknown>;
+  /** Parent Agent tool_use ID (for progress messages) */
+  parentToolUseID?: string;
+  toolUseID?: string;
 }
 
 // ── Config ──

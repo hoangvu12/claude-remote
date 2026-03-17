@@ -3,18 +3,20 @@ import chokidar, { type FSWatcher } from "chokidar";
 import fs from "node:fs";
 import { readFile, open } from "node:fs/promises";
 import path from "node:path";
-import { parseJSONLString, processAssistantBlocks, processUserBlocks, processNonConversation, walkCurrentBranch } from "./jsonl-parser.js";
-import { renderBatch } from "./discord-renderer.js";
-import { discordPayloadToOutgoing } from "./discord-helpers.js";
-import { resolveJSONLPath, ID_PREFIX, CONFIG_DIR } from "./utils.js";
-import type { JSONLMessage, ProcessedMessage, DaemonToParent, SessionInfoMessage } from "./types.js";
+import os from "node:os";
+import { parseJSONLString, processAssistantBlocks, processUserBlocks, processNonConversation, walkCurrentBranch, getToolInputPreview } from "./jsonl-parser.js";
+import { renderBatch, COLOR } from "./discord-renderer.js";
+import { resolveJSONLPath, ID_PREFIX, CONFIG_DIR, capSet, truncate, extractToolResultText } from "./utils.js";
+import type { JSONLMessage, ProcessedMessage, ContentBlock, ContentBlockToolUse, ContentBlockText, ContentBlockToolResult, DaemonToParent, SessionInfoMessage } from "./types.js";
 import { DiscordProvider } from "./providers/discord.js";
 import { createPipeline } from "./create-pipeline.js";
 import type { SessionContext } from "./handler.js";
 import type { HandlerPipeline } from "./pipeline.js";
-import { hasInput } from "./provider.js";
-import { showThinking } from "./handlers/thinking.js";
+import { hasInput, hasThreads } from "./provider.js";
 import { toolState } from "./handlers/tool-state.js";
+import { closePassiveGroup } from "./handlers/passive-tools.js";
+import { ActivityManager } from "./activity.js";
+import { setupSlashCommands } from "./slash-commands.js";
 
 // ── State ──
 
@@ -32,6 +34,7 @@ let knownUuids = new Set<string>();
 let ctx: SessionContext | null = null;
 let pipeline: HandlerPipeline | null = null;
 let provider: DiscordProvider | null = null;
+let activity: ActivityManager | null = null;
 
 // ── Batching ──
 
@@ -141,8 +144,9 @@ async function start() {
 
   saveSessionChannel(sessionId, channel.id);
 
-  // Create provider and pipeline
+  // Create provider and activity manager
   provider = new DiscordProvider(client, channel);
+  activity = new ActivityManager(provider, sendToParent);
 
   if (isContextClear) {
     await provider.send({ text: "🧹 **Context cleared** — new conversation started" });
@@ -162,6 +166,22 @@ async function start() {
     sendToPty: (text: string) => sendToParent({ type: "pty-write", text }),
   };
 
+  activity.setContext(ctx);
+  activity.onIdle(() => {
+    // Schedule on flushPromise so it runs AFTER any pending batch processing
+    flushPromise = flushPromise.then(() => closePassiveGroup(ctx!)).catch(() => {});
+  });
+
+  // Register slash commands
+  await setupSlashCommands(client, guildId, {
+    getCtx: () => ctx,
+    activity,
+    sendToParent,
+    provider,
+    projectDir,
+    sessionId,
+  });
+
   pipeline = createPipeline();
   pipeline.init(ctx);
 
@@ -169,9 +189,22 @@ async function start() {
   if (hasInput(provider)) {
     provider.onUserMessage((text) => {
       console.log(`[daemon] Discord input: ${text}`);
+      if (activity!.busy) {
+        const msg = activity!.enqueue(text);
+        provider!.send({
+          embed: {
+            description: `📥 Queued #${msg.id} (${activity!.queue.length} in queue)\n>>> ${text.slice(0, 200)}`,
+            color: COLOR.BLURPLE,
+          },
+        });
+        activity!.update(activity!.state, client);
+        return;
+      }
+      activity!.busy = true;
+      activity!.resetIdleTimer();
       ctx!.originMessages.add(text);
       sendToParent({ type: "pty-write", text });
-      showThinking(ctx!);
+      activity!.update("thinking", client);
     });
 
     provider.onInteraction((interaction) => {
@@ -218,7 +251,6 @@ async function start() {
           "3": "Manually approve edits",
         };
 
-        // Send raw — Ink's parser rejects multi-char "1\r" as a single invalid token
         sendToParent({ type: "pty-write", text: optionNum, raw: true });
         provider!.respond(interaction, {
           embed: {
@@ -242,12 +274,20 @@ async function start() {
       }
 
       if (interaction.type === "modal-submit") {
+        if (id.startsWith(ID_PREFIX.QUEUE_EDIT) || id.startsWith(`${ID_PREFIX.MODAL}${ID_PREFIX.QUEUE_EDIT}`)) {
+          const prefix = id.startsWith(ID_PREFIX.QUEUE_EDIT) ? ID_PREFIX.QUEUE_EDIT : `${ID_PREFIX.MODAL}${ID_PREFIX.QUEUE_EDIT}`;
+          const queueId = parseInt(id.slice(prefix.length));
+          const item = activity!.findInQueue(queueId);
+          if (item && interaction.text) {
+            item.text = interaction.text;
+            provider!.respond(interaction, { text: `✏️ Queue #${queueId} updated` });
+          }
+          return;
+        }
+
         if (id.includes(ID_PREFIX.PLAN_FEEDBACK)) {
-          // Plan feedback: press 4 to focus input, type text, Enter submits
-  
           const feedback = interaction.text?.trim();
           if (feedback) {
-            // Focus the "No, keep planning" input, type feedback, then submit
             sendToParent({ type: "pty-write", text: "4", raw: true });
             setTimeout(() => {
               sendToParent({ type: "pty-write", text: feedback, raw: true });
@@ -257,7 +297,6 @@ async function start() {
               embed: { description: `📐 Keep planning: ${feedback}`, color: 0xf5a623 },
             });
           } else {
-            // No feedback — press Escape to cancel and stay in plan mode
             sendToParent({ type: "pty-write", text: "\x1b", raw: true });
             provider!.respond(interaction, {
               embed: { description: "📐 Staying in plan mode", color: 0xf5a623 },
@@ -276,6 +315,7 @@ async function start() {
 
   sendToParent({ type: "daemon-ready", channelId: channel.id });
 
+  activity.update("idle", client);
   await replayHistory();
   startWatcher();
 }
@@ -359,10 +399,8 @@ async function replayHistory() {
     }
 
     // Send recent messages in full (batched — tool results skipped, threads not created for replay)
-    for (const payload of renderBatch(recent)) {
-      for (const msg of discordPayloadToOutgoing(payload)) {
-        await provider.send(msg);
-      }
+    for (const msg of renderBatch(recent)) {
+      await provider.send(msg);
     }
 
     console.log(`[daemon] Replayed: ${older.length} summarized, ${recent.length} full`);
@@ -416,7 +454,11 @@ async function _flushBatch() {
   pendingBatch = [];
 
   for (const pm of batch) {
-    await pipeline.process(pm, ctx);
+    try {
+      await pipeline.process(pm, ctx);
+    } catch (err) {
+      console.error(`[daemon] Error processing ${pm.type}:`, err);
+    }
   }
 }
 
@@ -439,6 +481,7 @@ async function handleFileChange(filePath: string) {
     lastFileSize = newSize;
 
     const newLines = buf.toString("utf-8").split("\n").filter(Boolean);
+    let rewindHandled = false; // prevent cascading rewind detection within a batch
 
     for (const line of newLines) {
       let msg: JSONLMessage;
@@ -452,13 +495,47 @@ async function handleFileChange(filePath: string) {
         ctx.permissionMode = msg.permissionMode;
       }
 
-      // Rewind detection
+      // Any JSONL event while busy resets the idle safety timer
+      if (activity?.busy) activity.resetIdleTimer();
+
+      // Activity tracking from JSONL events (skip if recently stopped)
+      if (activity && Date.now() >= activity.stopOverrideUntil) {
+        if (msg.type === "assistant" && msg.message && Array.isArray(msg.message.content)) {
+          const blocks = msg.message.content as ContentBlock[];
+          const hasToolUse = blocks.some((b) => b.type === "tool_use");
+          if (hasToolUse) {
+            activity.update("working");
+          } else if (blocks.some((b) => b.type === "text")) {
+            // Text-only assistant message = turn complete
+            activity.busy = false;
+            activity.update("idle"); // onIdle callback closes passive group
+            setTimeout(() => activity!.tryDequeue(), 500);
+          }
+        } else if (msg.type === "user" && msg.message && !activity.busy) {
+          activity.busy = true;
+          activity.resetIdleTimer();
+          activity.update("thinking");
+        }
+      }
+
+      // Agent sub-agent progress → forward to parent tool's thread
+      if (msg.type === "progress" && msg.data?.type === "agent_progress" && msg.parentToolUseID) {
+        await forwardAgentProgress(msg);
+      }
+
+      // Rewind detection (only once per batch to avoid cascading)
+      // Only trigger on main-chain user/assistant messages — subagent progress
+      // and sidechain messages produce parentUuids outside knownUuids normally
       if (
+        !rewindHandled &&
         !msg.isSidechain &&
+        !msg.parentToolUseID &&
+        (msg.type === "assistant" || msg.type === "user") &&
         msg.parentUuid &&
         lastMessageUuid &&
         !knownUuids.has(msg.parentUuid)
       ) {
+        rewindHandled = true;
         if (batchTimer) { clearTimeout(batchTimer); batchTimer = null; }
         pendingBatch = [];
         await ctx.provider.send({ text: "⏪ Conversation rewound" });
@@ -494,13 +571,58 @@ async function handleFileChange(filePath: string) {
       lastMessageUuid = msg.uuid;
     }
 
-    // Cap sets to prevent unbounded growth
-    if (processedUuids.size > MAX_SET_SIZE) processedUuids = new Set([...processedUuids].slice(-MAX_SET_SIZE / 2));
-    if (ctx.resolvedToolUseIds.size > MAX_SET_SIZE) ctx.resolvedToolUseIds = new Set([...ctx.resolvedToolUseIds].slice(-MAX_SET_SIZE / 2));
-    if (knownUuids.size > MAX_SET_SIZE) knownUuids = new Set([...knownUuids].slice(-MAX_SET_SIZE / 2));
-    if (toolState.taskToolUseIds.size > MAX_SET_SIZE) toolState.taskToolUseIds = new Set([...toolState.taskToolUseIds].slice(-MAX_SET_SIZE / 2));
+    // Cap sets to prevent unbounded growth (in-place to preserve references)
+    capSet(processedUuids, MAX_SET_SIZE);
+    capSet(ctx.resolvedToolUseIds, MAX_SET_SIZE);
+    capSet(knownUuids, MAX_SET_SIZE);
+    capSet(toolState.taskToolUseIds, MAX_SET_SIZE);
   } catch (err) {
     console.error("[daemon] Error reading JSONL changes:", err);
+  }
+}
+
+/** Forward sub-agent progress to the parent tool's thread */
+async function forwardAgentProgress(msg: JSONLMessage) {
+  if (!ctx) return;
+  const parentEntry = toolState.toolUseThreads.get(msg.parentToolUseID!);
+  if (!parentEntry?.thread || !hasThreads(ctx.provider)) return;
+
+  const innerMsg = msg.data!.message as { type: string; message?: { role: string; content: ContentBlock[] | string } } | undefined;
+  if (!innerMsg?.message) return;
+
+  const content = innerMsg.message.content;
+  if (innerMsg.type === "assistant" && Array.isArray(content)) {
+    for (const block of content as ContentBlock[]) {
+      if (block.type === "tool_use") {
+        const tb = block as ContentBlockToolUse;
+        const preview = getToolInputPreview(tb.name, tb.input);
+        await ctx.provider.sendToThread(parentEntry.thread, {
+          embed: { description: `🔧 **${tb.name}** ${preview}`, color: COLOR.TOOL },
+        });
+      } else if (block.type === "text" && (block as ContentBlockText).text.trim()) {
+        await ctx.provider.sendToThread(parentEntry.thread, {
+          text: truncate((block as ContentBlockText).text.trim(), 1900),
+        });
+      }
+    }
+  } else if (innerMsg.type === "user" && Array.isArray(content)) {
+    for (const block of content as ContentBlock[]) {
+      if (block.type === "tool_result") {
+        const tb = block as ContentBlockToolResult;
+        const resultText = extractToolResultText(tb.content).trim();
+        const isError = !!tb.is_error;
+        const icon = isError ? "❌" : "✅";
+        if (resultText && resultText !== "undefined") {
+          await ctx.provider.sendToThread(parentEntry.thread, {
+            text: `${icon}\n\`\`\`\n${truncate(resultText, 1800)}\n\`\`\``,
+          });
+        } else {
+          await ctx.provider.sendToThread(parentEntry.thread, {
+            text: `${icon} *(no output)*`,
+          });
+        }
+      }
+    }
   }
 }
 
@@ -556,6 +678,7 @@ process.on("SIGINT", cleanup);
 process.on("disconnect", cleanup);
 
 async function cleanup() {
+  if (activity) activity.destroy();
   if (pipeline) pipeline.destroy();
   if (watcher) await watcher.close();
   if (provider) {

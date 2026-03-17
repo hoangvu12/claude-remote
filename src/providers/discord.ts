@@ -290,6 +290,7 @@ export class DiscordProvider implements OutputProvider, ThreadCapable, InputCapa
   // ── Expose channel for daemon startup tasks ──
 
   getChannel(): TextChannel { return this.channel; }
+  getClient(): Client { return this.client; }
 
   /** Clean up old threads from previous connections */
   async cleanupThreads(): Promise<void> {

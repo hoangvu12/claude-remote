@@ -1,14 +1,5 @@
-import { readFile } from "node:fs/promises";
 import type { JSONLMessage, ContentBlock, ContentBlockToolUse, ProcessedMessage } from "./types.js";
 import { truncate, extractToolResultText } from "./utils.js";
-
-/**
- * Parse a JSONL file into an array of messages.
- */
-export async function parseJSONLFile(filePath: string): Promise<JSONLMessage[]> {
-  const raw = await readFile(filePath, "utf-8");
-  return parseJSONLString(raw);
-}
 
 export function parseJSONLString(raw: string): JSONLMessage[] {
   const messages: JSONLMessage[] = [];
@@ -188,7 +179,7 @@ export function processUserBlocks(msg: JSONLMessage): ProcessedMessage[] {
   return results;
 }
 
-function getToolInputPreview(name: string, input: Record<string, unknown>): string {
+export function getToolInputPreview(name: string, input: Record<string, unknown>): string {
   switch (name) {
     case "Bash":
       return `\`${truncate(String(input.command || ""), 100)}\``;

@@ -18,6 +18,8 @@ export const ID_PREFIX = {
   MODAL: "modal:",
   PLAN: "plan:",
   PLAN_FEEDBACK: "plan-feedback:",
+  MODE: "mode:",
+  QUEUE_EDIT: "queue-edit:",
 } as const;
 
 // ── Helpers ──
@@ -52,6 +54,40 @@ export function extractToolResultText(content: string | Array<{ type: string; te
     return content.map((b) => b.text || "").join("\n");
   }
   return "";
+}
+
+// ── Permission mode cycling (matches Claude Code's Shift+Tab order) ──
+
+const MODE_CYCLE = ["default", "acceptEdits", "plan", "bypassPermissions"] as const;
+
+export const MODE_LABELS: Record<string, string> = {
+  default: "Default",
+  acceptEdits: "Accept edits",
+  plan: "Plan Mode",
+  bypassPermissions: "Bypass Permissions",
+};
+
+/**
+ * Calculate the number of Shift+Tab presses to go from `current` to `target`.
+ * Returns 0 if already at target or modes are unknown.
+ */
+export function modeShiftTabCount(current: string | null, target: string): number {
+  const from = MODE_CYCLE.indexOf((current || "default") as typeof MODE_CYCLE[number]);
+  const to = MODE_CYCLE.indexOf(target as typeof MODE_CYCLE[number]);
+  if (from === -1 || to === -1 || from === to) return 0;
+  // Cycle forward: (to - from + len) % len
+  return (to - from + MODE_CYCLE.length) % MODE_CYCLE.length;
+}
+
+/**
+ * Cap a Set to maxSize, keeping the most recent entries (last added).
+ * Mutates in place to preserve references.
+ */
+export function capSet<T>(set: Set<T>, maxSize: number): void {
+  if (set.size <= maxSize) return;
+  const keep = [...set].slice(-Math.floor(maxSize / 2));
+  set.clear();
+  for (const item of keep) set.add(item);
 }
 
 /**

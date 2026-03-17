@@ -2,6 +2,7 @@ import * as pty from "node-pty";
 import net from "node:net";
 import path from "node:path";
 import fs from "node:fs";
+import os from "node:os";
 import { fork, type ChildProcess } from "node:child_process";
 import { STATUS_FLAG, PIPE_REGISTRY, safeUnlink } from "./utils.js";
 import type { DaemonToParent, PipeMessage } from "./types.js";
@@ -165,13 +166,21 @@ function startDaemon(channelName?: string) {
     stdio: ["pipe", "pipe", "pipe", "ipc"],
   });
 
-  // Silence daemon output
-  daemon.stdout?.resume();
-  daemon.stderr?.resume();
+  // Log daemon output to file for debugging
+  const logStream = fs.createWriteStream(path.join(os.homedir(), ".discord-rc", "daemon.log"), { flags: "a" });
+  daemon.stdout?.pipe(logStream);
+  daemon.stderr?.pipe(logStream);
 
   daemon.on("message", (msg: DaemonToParent) => {
     if (msg.type === "pty-write") {
-      proc.write(msg.raw ? msg.text : msg.text + "\r");
+      if (msg.raw) {
+        proc.write(msg.text);
+      } else if (msg.text.includes("\n")) {
+        // Wrap multiline text in bracketed paste so Ink treats it as a single paste
+        proc.write(`\x1b[200~${msg.text}\x1b[201~\r`);
+      } else {
+        proc.write(msg.text + "\r");
+      }
     } else if (msg.type === "daemon-ready") {
       lastChannelId = msg.channelId;
       setStatusFlag(true);

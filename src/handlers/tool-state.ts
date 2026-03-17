@@ -1,4 +1,4 @@
-import type { ProviderMessage, ProviderThread, OutgoingMessage } from "../provider.js";
+import type { ProviderMessage, ProviderThread, OutgoingMessage, OutputProvider } from "../provider.js";
 
 // ── Task types ──
 
@@ -35,6 +35,33 @@ export const toolState = {
   taskCreateTempIds: new Map<string, string>(),
   taskMap: new Map<string, TaskInfo>(),
   taskPinnedMessage: null as ProviderMessage | null,
+
+  /** Progress intervals for long-running tool threads */
+  progressIntervals: new Map<string, ReturnType<typeof setInterval>>(),
+  progressMessages: new Map<string, ProviderMessage>(),
+
+  /** Clean up progress timer and message for a resolved tool */
+  async cleanupProgress(toolUseId: string, provider: OutputProvider): Promise<void> {
+    const interval = this.progressIntervals.get(toolUseId);
+    if (interval) {
+      clearInterval(interval);
+      this.progressIntervals.delete(toolUseId);
+    }
+    const msg = this.progressMessages.get(toolUseId);
+    if (msg) {
+      try { await provider.delete(msg); } catch { /* already gone */ }
+      this.progressMessages.delete(toolUseId);
+    }
+  },
+
+  /** Clean up all pending progress intervals (e.g. on destroy) */
+  clearAllProgress(): void {
+    for (const interval of this.progressIntervals.values()) {
+      clearInterval(interval);
+    }
+    this.progressIntervals.clear();
+    this.progressMessages.clear();
+  },
 };
 
 export const INLINE_RESULT_THRESHOLD = 400;
