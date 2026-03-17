@@ -2,10 +2,10 @@ import type { MessageHandler, SessionContext, HandlerResult } from "../handler.j
 import type { ProcessedMessage } from "../types.js";
 import type { ProviderMessage } from "../provider.js";
 import { ID_PREFIX } from "../utils.js";
+import { COLOR } from "../discord-renderer.js";
 
 const PLAN_TOOLS = new Set(["EnterPlanMode", "ExitPlanMode"]);
 const COLOR_AMBER = 0xf5a623;
-const COLOR_BLUE = 0x5865f2;
 
 let planMessage: ProviderMessage | null = null;
 
@@ -30,7 +30,7 @@ export class PlanModeHandler implements MessageHandler {
       const msg = {
         embed: {
           description: "📐 **Ready to code?**",
-          color: COLOR_BLUE,
+          color: COLOR.BLURPLE,
         },
         actions: [
           { id: `${ID_PREFIX.PLAN}1`, label: "Clear context & implement", style: "success" as const },

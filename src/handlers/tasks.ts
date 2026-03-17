@@ -1,6 +1,7 @@
 import type { MessageHandler, SessionContext, HandlerResult } from "../handler.js";
 import type { ProcessedMessage } from "../types.js";
 import { toolState, TASK_TOOLS, type TaskInfo } from "./tool-state.js";
+import { COLOR } from "../discord-renderer.js";
 
 // ── Task embed rendering (provider-agnostic) ──
 
@@ -24,7 +25,7 @@ function renderTaskEmbed() {
     embed: {
       title: "📋 Tasks",
       description: lines.join("\n") || "*No tasks*",
-      color: 0x5865f2,
+      color: COLOR.BLURPLE,
       footer: `${bar}  ${done}/${total} completed`,
     },
   };
