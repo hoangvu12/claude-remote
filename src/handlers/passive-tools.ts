@@ -2,9 +2,9 @@ import type { MessageHandler, SessionContext, HandlerResult } from "../handler.j
 import type { ProcessedMessage } from "../types.js";
 import type { ProviderMessage } from "../provider.js";
 import { hasThreads, editOrSend } from "../provider.js";
-import { toolState, PASSIVE_TOOLS, INLINE_RESULT_THRESHOLD } from "./tool-state.js";
+import { toolState, PASSIVE_TOOLS } from "./tool-state.js";
 import { renderToolResultThreadMessages, resultColor, COLOR } from "../discord-renderer.js";
-import { truncate } from "../utils.js";
+import { truncate, mimeToExt } from "../utils.js";
 
 function isPassiveToolUse(pm: ProcessedMessage): boolean {
   return pm.type === "tool-use" && !!pm.toolUseId && PASSIVE_TOOLS.has(pm.toolName || "");
@@ -29,41 +29,42 @@ export async function closePassiveGroup(ctx: SessionContext) {
   const hasError = g.results.some((r) => r.isError);
   const icon = hasError ? "❌" : "✅";
 
-  // Combine non-empty results (trim once per entry)
-  const trimmedResults = g.results
-    .map((r) => r.content.trim())
-    .filter((t) => t && t !== "undefined");
-  const combinedResult = trimmedResults.join("\n");
-
-  const isShort = combinedResult.length <= INLINE_RESULT_THRESHOLD;
-
-  if (isShort) {
+  if (!hasThreads(provider)) {
+    // No thread support — inline fallback
+    const combinedResult = g.results.map((r) => r.content.trim()).filter((t) => t && t !== "undefined").join("\n");
     const desc = combinedResult
-      ? `${icon} ${summary}\n\`\`\`\n${combinedResult}\n\`\`\``
+      ? `${icon} ${summary}\n\`\`\`\n${truncate(combinedResult, 3900)}\n\`\`\``
       : `${icon} ${summary}`;
     await editOrSend(provider, g.inlineMessage, {
       embed: { description: desc, color: resultColor(hasError) },
     });
-  } else if (hasThreads(provider)) {
-    // Long → delete inline embed, create thread with full results
-    if (g.inlineMessage) {
-      try { await provider.delete(g.inlineMessage); } catch { /* already gone */ }
-    }
+    return;
+  }
 
-    const thread = await provider.createThread(truncate(`${summary} ${icon}`, 100));
-    for (const r of g.results) {
-      for (const msg of renderToolResultThreadMessages(r.content, r.isError)) {
-        await provider.sendToThread(thread, { text: msg.content });
+  // Always use thread — delete inline embed
+  if (g.inlineMessage) {
+    try { await provider.delete(g.inlineMessage); } catch { /* already gone */ }
+  }
+
+  const thread = await provider.createThread(truncate(`${summary} ${icon}`, 100));
+  for (const r of g.results) {
+    for (const msg of renderToolResultThreadMessages(r.content, r.isError)) {
+      await provider.sendToThread(thread, { text: msg.content });
+    }
+    // Send images from this result
+    if (r.images?.length) {
+      for (let i = 0; i < r.images.length; i++) {
+        const img = r.images[i];
+        const ext = mimeToExt(img.mediaType);
+        const buf = Buffer.from(img.data, "base64");
+        if (buf.length > 8 * 1024 * 1024) continue;
+        await provider.sendToThread(thread, {
+          files: [{ name: `image-${i + 1}.${ext}`, data: buf }],
+        });
       }
     }
-    try { await provider.archiveThread(thread); } catch { /* best effort */ }
-  } else {
-    // No thread support — truncate into embed
-    const desc = `${icon} ${summary}\n\`\`\`\n${truncate(combinedResult, 3900)}\n\`\`\``;
-    await editOrSend(provider, g.inlineMessage, {
-      embed: { description: desc, color: resultColor(hasError) },
-    });
   }
+  try { await provider.archiveThread(thread); } catch { /* best effort */ }
 }
 
 export class PassiveToolHandler implements MessageHandler {

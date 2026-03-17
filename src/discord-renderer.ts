@@ -1,6 +1,6 @@
 import type { ProcessedMessage } from "./types.js";
 import type { OutgoingMessage, OutputProvider } from "./provider.js";
-import { truncate, ID_PREFIX } from "./utils.js";
+import { truncate, ID_PREFIX, mimeToExt } from "./utils.js";
 
 // ── Colors ──
 
@@ -45,14 +45,31 @@ function splitContent(text: string, max = MAX_CONTENT): string[] {
 
 export function renderMessage(msg: ProcessedMessage): OutgoingMessage[] {
   switch (msg.type) {
-    case "user-prompt":
-      return [{
+    case "user-prompt": {
+      const out: OutgoingMessage = {
         embed: {
           author: "You",
-          description: msg.content.slice(0, MAX_EMBED_DESC),
+          description: (msg.content || "(image)").slice(0, MAX_EMBED_DESC),
           color: COLOR.USER,
         },
-      }];
+      };
+      // Attach first user-pasted image inside the embed, rest as separate files
+      if (msg.images?.length) {
+        const files = msg.images
+          .map((img, i) => {
+            const buf = Buffer.from(img.data, "base64");
+            if (buf.length > 8 * 1024 * 1024) return null;
+            return { name: `image-${i + 1}.${mimeToExt(img.mediaType)}`, data: buf };
+          })
+          .filter((f): f is NonNullable<typeof f> => f !== null);
+        if (files.length > 0) {
+          // First image goes inside the embed
+          out.embedImage = `attachment://${files[0].name}`;
+          out.files = files;
+        }
+      }
+      return [out];
+    }
 
     case "assistant-text":
       return splitContent(msg.content).map((chunk) => ({ text: chunk }));

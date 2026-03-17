@@ -31,7 +31,7 @@ export const toolState = {
     counts: Map<string, number>;
     toolUseIds: Set<string>;
     /** Buffered results for inline display */
-    results: Array<{ content: string; isError: boolean }>;
+    results: Array<{ content: string; isError: boolean; images?: Array<{ mediaType: string; data: string }> }>;
   } | null,
 
   /** Task tool tracking */

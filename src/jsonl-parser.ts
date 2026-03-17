@@ -1,5 +1,5 @@
 import type { JSONLMessage, ContentBlock, ContentBlockToolUse, ProcessedMessage } from "./types.js";
-import { truncate, extractToolResultText } from "./utils.js";
+import { truncate, extractToolResultText, extractToolResultImages } from "./utils.js";
 
 export function parseJSONLString(raw: string): JSONLMessage[] {
   const messages: JSONLMessage[] = [];
@@ -141,6 +141,7 @@ const INTERNAL_PATTERNS = [
   /<local-command/,
   /Command running in background with ID:/,
   /Read the output file to retrieve/,
+  /^\[Image: source: .+\]$/,
 ];
 
 function isInternalContent(text: string): boolean {
@@ -160,9 +161,35 @@ export function processUserBlocks(msg: JSONLMessage): ProcessedMessage[] {
   if (!Array.isArray(content)) return [];
 
   const results: ProcessedMessage[] = [];
+
+  // Collect top-level text and images from user messages (e.g. pasted images in CLI)
+  const topTexts: string[] = [];
+  const topImages: Array<{ mediaType: string; data: string }> = [];
+  for (const block of content) {
+    if (block.type === "text" && (block as { text: string }).text?.trim()) {
+      const text = (block as { text: string }).text.trim();
+      if (!isInternalContent(text)) topTexts.push(text);
+    }
+    if (block.type === "image") {
+      const src = (block as { source?: { type: string; media_type: string; data: string } }).source;
+      if (src?.type === "base64") {
+        topImages.push({ mediaType: src.media_type, data: src.data });
+      }
+    }
+  }
+  if (topTexts.length > 0 || topImages.length > 0) {
+    results.push({
+      type: "user-prompt",
+      content: topTexts.join("\n"),
+      uuid: msg.uuid,
+      images: topImages.length > 0 ? topImages : undefined,
+    });
+  }
+
   for (const block of content) {
     if (block.type === "tool_result") {
       const raw = extractToolResultText(block.content);
+      const images = extractToolResultImages(block.content as Parameters<typeof extractToolResultImages>[0]);
 
       // Skip internal/discord-cmd results
       if (isInternalContent(raw) || /Discord sync (enabled|disabled)/.test(raw)) continue;
@@ -172,6 +199,7 @@ export function processUserBlocks(msg: JSONLMessage): ProcessedMessage[] {
         content: raw,
         uuid: msg.uuid,
         toolUseId: block.tool_use_id,
+        images: images.length > 0 ? images : undefined,
       });
     }
   }

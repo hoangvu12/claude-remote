@@ -4,7 +4,7 @@ import type { ProviderThread } from "../provider.js";
 import { hasThreads, editOrSend } from "../provider.js";
 import { toolState, INLINE_RESULT_THRESHOLD } from "./tool-state.js";
 import { renderToolResultThreadMessages, resultColor } from "../discord-renderer.js";
-import { truncate } from "../utils.js";
+import { truncate, mimeToExt } from "../utils.js";
 
 /** Send result content to a thread */
 async function sendResultToThread(
@@ -12,11 +12,34 @@ async function sendResultToThread(
   thread: ProviderThread,
   content: string,
   isError: boolean,
+  images?: Array<{ mediaType: string; data: string }>,
 ) {
   const provider = ctx.provider;
   if (!hasThreads(provider)) return;
   for (const msg of renderToolResultThreadMessages(content, isError)) {
     await provider.sendToThread(thread, { text: msg.content });
+  }
+  if (images?.length) {
+    await sendImagesToThread(ctx, thread, images);
+  }
+}
+
+/** Send decoded images as file attachments to a thread */
+async function sendImagesToThread(
+  ctx: SessionContext,
+  thread: ProviderThread,
+  images: Array<{ mediaType: string; data: string }>,
+) {
+  const provider = ctx.provider;
+  if (!hasThreads(provider)) return;
+  for (let i = 0; i < images.length; i++) {
+    const img = images[i];
+    const ext = mimeToExt(img.mediaType);
+    const buf = Buffer.from(img.data, "base64");
+    if (buf.length > 8 * 1024 * 1024) continue; // skip files over 8MB Discord limit
+    await provider.sendToThread(thread, {
+      files: [{ name: `image-${i + 1}.${ext}`, data: buf }],
+    });
   }
 }
 
@@ -63,7 +86,7 @@ export class ToolResultHandler implements MessageHandler {
     // Passive group results → buffer for display at close
     const group = toolState.activePassiveGroup;
     if (group && group.toolUseIds.has(pm.toolUseId)) {
-      group.results.push({ content: pm.content, isError });
+      group.results.push({ content: pm.content, isError, images: pm.images });
       toolState.toolUseThreads.delete(pm.toolUseId);
       return "consumed";
     }
@@ -74,7 +97,7 @@ export class ToolResultHandler implements MessageHandler {
 
     // Already escalated to thread (slow >5s) → inline embed was already deleted
     if (entry.thread && hasThreads(provider)) {
-      await sendResultToThread(ctx, entry.thread, resultText, isError);
+      await sendResultToThread(ctx, entry.thread, resultText, isError, pm.images);
       toolState.toolUseThreads.delete(pm.toolUseId);
 
       // Rename and archive if no other tools share this thread
@@ -88,7 +111,7 @@ export class ToolResultHandler implements MessageHandler {
     }
 
     // Fast result — no thread yet
-    if (isEmpty || isShort) {
+    if ((isEmpty || isShort) && !pm.images?.length) {
       const desc = isEmpty
         ? `${icon} ${label} *(no output)*`
         : `${icon} ${label}\n\`\`\`\n${resultText}\n\`\`\``;
@@ -108,7 +131,7 @@ export class ToolResultHandler implements MessageHandler {
         }
       }
 
-      await sendResultToThread(ctx, thread, resultText, isError);
+      await sendResultToThread(ctx, thread, resultText, isError, pm.images);
       try { await provider.archiveThread(thread); } catch { /* best effort */ }
       toolState.toolUseThreads.delete(pm.toolUseId);
     } else {
