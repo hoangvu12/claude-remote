@@ -11,13 +11,19 @@ export const COLOR = {
   TOOL: INVISIBLE,
   TOOL_OK: INVISIBLE,
   TOOL_ERR: INVISIBLE,
+  ERROR_RED: 0xed4245,
   PERMISSION: INVISIBLE,
   QUESTION: INVISIBLE,
   SYSTEM: INVISIBLE,
   BLURPLE: 0x5865f2,
 } as const;
 
-const MAX_EMBED_DESC = 4000;
+/** Return the appropriate embed color for a tool result */
+export function resultColor(isError: boolean): number {
+  return isError ? COLOR.ERROR_RED : COLOR.TOOL_OK;
+}
+
+export const MAX_EMBED_DESC = 4000;
 const MAX_CONTENT = 1900;
 
 function splitContent(text: string, max = MAX_CONTENT): string[] {

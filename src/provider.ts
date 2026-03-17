@@ -75,3 +75,15 @@ export function hasThreads(p: OutputProvider): p is OutputProvider & ThreadCapab
 export function hasInput(p: OutputProvider): p is OutputProvider & InputCapable {
   return "onUserMessage" in p;
 }
+
+/** Edit an existing message, falling back to send if edit fails or handle is null */
+export async function editOrSend(
+  provider: OutputProvider,
+  handle: ProviderMessage | null | undefined,
+  msg: OutgoingMessage,
+): Promise<void> {
+  if (handle) {
+    try { await provider.edit(handle, msg); return; } catch { /* edit failed, fall through */ }
+  }
+  await provider.send(msg);
+}
