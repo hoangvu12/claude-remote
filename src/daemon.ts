@@ -580,7 +580,15 @@ async function handleFileChange(filePath: string) {
 
       // Activity tracking from JSONL events (skip if recently stopped)
       if (activity && Date.now() >= activity.stopOverrideUntil) {
-        if (msg.type === "assistant" && msg.message && Array.isArray(msg.message.content)) {
+        if (msg.type === "assistant" && (msg as unknown as Record<string, unknown>).isApiErrorMessage) {
+          // API error (e.g. 500) — written as an assistant message with isApiErrorMessage: true
+          await ctx.provider.send({
+            embed: { description: "⚠️ **API error** — request failed (Claude returned an error)", color: COLOR.ERROR_RED },
+          });
+          activity.busy = false;
+          activity.update("idle");
+          setTimeout(() => activity!.tryDequeue(), 500);
+        } else if (msg.type === "assistant" && msg.message && Array.isArray(msg.message.content)) {
           const blocks = msg.message.content as ContentBlock[];
           const hasToolUse = blocks.some((b) => b.type === "tool_use");
           if (hasToolUse) {
