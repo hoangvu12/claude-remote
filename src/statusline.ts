@@ -31,17 +31,24 @@ process.stdin.on("end", () => {
   const context = session.context_window?.used_percentage ?? 0;
   const cost = session.cost?.total_cost_usd;
 
-  // Check if Discord RC daemon is active (validate PID is alive)
+  // Check if Discord RC daemon is active for THIS session.
+  // CLAUDE_REMOTE_PIPE is only set when running under claude-remote (rc.ts).
+  // Its format is \\.\pipe\claude-remote-{pid}, so extract the rc PID from it.
   let isActive = false;
-  try {
-    const pid = parseInt(fs.readFileSync(STATUS_FLAG, "utf-8").trim(), 10);
-    if (pid) {
-      process.kill(pid, 0); // throws if process doesn't exist
-      isActive = true;
+  const pipeName = process.env.CLAUDE_REMOTE_PIPE;
+  if (pipeName) {
+    const rcPidMatch = pipeName.match(/claude-remote-(\d+)$/);
+    const rcPid = rcPidMatch ? parseInt(rcPidMatch[1], 10) : null;
+    try {
+      const flagPid = parseInt(fs.readFileSync(STATUS_FLAG, "utf-8").trim(), 10);
+      if (flagPid && rcPid && flagPid === rcPid) {
+        process.kill(flagPid, 0); // throws if process doesn't exist
+        isActive = true;
+      }
+    } catch {
+      // File missing or PID dead — clean up stale flag
+      try { fs.unlinkSync(STATUS_FLAG); } catch { /* already gone */ }
     }
-  } catch {
-    // File missing or PID dead — clean up stale flag
-    try { fs.unlinkSync(STATUS_FLAG); } catch { /* already gone */ }
   }
   const rcStatus = isActive
     ? "\x1b[32m● On\x1b[0m"   // green dot
