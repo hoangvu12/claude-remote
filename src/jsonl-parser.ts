@@ -105,7 +105,8 @@ export function processAssistantBlocks(msg: JSONLMessage): ProcessedMessage[] {
     if (block.type === "tool_use") {
       const tb = block as ContentBlockToolUse;
 
-      // Skip discord-cmd calls — internal to the /discord skill
+      // Skip internal tools
+      if (tb.name === "ToolSearch") continue;
       if (tb.name === "Bash") {
         const cmd = String((tb.input as Record<string, unknown>).command || "");
         if (cmd.includes("discord-cmd")) continue;

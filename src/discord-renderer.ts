@@ -11,14 +11,16 @@ import { truncate, ID_PREFIX } from "./utils.js";
 
 // ── Colors ──
 
+const INVISIBLE = 0x2b2d31; // matches Discord dark theme background
+
 const COLOR = {
-  USER: 0x5865f2,       // blurple — user prompts
-  TOOL: 0x2c2f33,       // dark gray — tool calls
-  TOOL_OK: 0x2ecc71,    // green — success
-  TOOL_ERR: 0xe74c3c,   // red — error
-  PERMISSION: 0xf39c12, // orange — permission
-  QUESTION: 0x9b59b6,   // purple — questions
-  SYSTEM: 0x95a5a6,     // gray — system/meta
+  USER: INVISIBLE,
+  TOOL: INVISIBLE,
+  TOOL_OK: INVISIBLE,
+  TOOL_ERR: INVISIBLE,
+  PERMISSION: INVISIBLE,
+  QUESTION: INVISIBLE,
+  SYSTEM: INVISIBLE,
 } as const;
 
 export { COLOR };
@@ -143,10 +145,10 @@ export function renderToolResultThreadMessages(content: string, isError: boolean
   }
 
   const prefix = isError ? "❌ **Error:**\n" : "";
-  const chunks = splitContent(content, MAX_CONTENT - 20); // leave room for code fences
+  const chunks = splitContent(content);
 
   return chunks.map((chunk, i) => ({
-    content: `${i === 0 ? prefix : ""}\`\`\`\n${chunk}\n\`\`\``,
+    content: `${i === 0 ? prefix : ""}${chunk}`,
   }));
 }
 
