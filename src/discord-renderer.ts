@@ -1,19 +1,12 @@
-import {
-  ActionRowBuilder,
-  ButtonBuilder,
-  ButtonStyle,
-  EmbedBuilder,
-  StringSelectMenuBuilder,
-  type MessageCreateOptions,
-} from "discord.js";
 import type { ProcessedMessage } from "./types.js";
+import type { OutgoingMessage, OutputProvider } from "./provider.js";
 import { truncate, ID_PREFIX } from "./utils.js";
 
 // ── Colors ──
 
 const INVISIBLE = 0x2b2d31; // matches Discord dark theme background
 
-const COLOR = {
+export const COLOR = {
   USER: INVISIBLE,
   TOOL: INVISIBLE,
   TOOL_OK: INVISIBLE,
@@ -21,9 +14,8 @@ const COLOR = {
   PERMISSION: INVISIBLE,
   QUESTION: INVISIBLE,
   SYSTEM: INVISIBLE,
+  BLURPLE: 0x5865f2,
 } as const;
-
-export { COLOR };
 
 const MAX_EMBED_DESC = 4000;
 const MAX_CONTENT = 1900;
@@ -45,93 +37,100 @@ function splitContent(text: string, max = MAX_CONTENT): string[] {
 
 // ── Single message renderer ──
 
-export function renderMessage(msg: ProcessedMessage): MessageCreateOptions[] {
+export function renderMessage(msg: ProcessedMessage): OutgoingMessage[] {
   switch (msg.type) {
-    case "user-prompt": {
-      const embed = new EmbedBuilder()
-        .setAuthor({ name: "You" })
-        .setDescription(msg.content.slice(0, MAX_EMBED_DESC))
-        .setColor(COLOR.USER);
-      return [{ embeds: [embed] }];
-    }
+    case "user-prompt":
+      return [{
+        embed: {
+          author: "You",
+          description: msg.content.slice(0, MAX_EMBED_DESC),
+          color: COLOR.USER,
+        },
+      }];
 
-    case "assistant-text": {
-      const chunks = splitContent(msg.content);
-      return chunks.map((chunk) => ({ content: chunk }));
-    }
+    case "assistant-text":
+      return splitContent(msg.content).map((chunk) => ({ text: chunk }));
 
-    case "tool-use": {
-      const embed = new EmbedBuilder()
-        .setDescription(`🔧 **${msg.toolName}** ${msg.content}`)
-        .setColor(COLOR.TOOL);
-      return [{ embeds: [embed] }];
-    }
+    case "tool-use":
+      return [{
+        embed: {
+          description: `🔧 **${msg.toolName}** ${msg.content}`,
+          color: COLOR.TOOL,
+        },
+      }];
 
     case "tool-result": {
       if (!msg.content.trim() || msg.content === "undefined") return [];
-      const embed = new EmbedBuilder()
-        .setDescription(`\`\`\`\n${msg.content.slice(0, MAX_EMBED_DESC - 10)}\n\`\`\``)
-        .setColor(COLOR.TOOL_OK);
-      return [{ embeds: [embed] }];
+      return [{
+        embed: {
+          description: `\`\`\`\n${msg.content.slice(0, MAX_EMBED_DESC - 10)}\n\`\`\``,
+          color: COLOR.TOOL_OK,
+        },
+      }];
     }
 
-    case "tool-result-error": {
-      const embed = new EmbedBuilder()
-        .setTitle("❌ Error")
-        .setDescription(`\`\`\`\n${msg.content.slice(0, MAX_EMBED_DESC - 10)}\n\`\`\``)
-        .setColor(COLOR.TOOL_ERR);
-      return [{ embeds: [embed] }];
-    }
+    case "tool-result-error":
+      return [{
+        embed: {
+          title: "❌ Error",
+          description: `\`\`\`\n${msg.content.slice(0, MAX_EMBED_DESC - 10)}\n\`\`\``,
+          color: COLOR.TOOL_ERR,
+        },
+      }];
 
     case "ask-user-question": {
       if (!msg.questions) return [];
 
       return msg.questions.map((q) => {
-        const embed = new EmbedBuilder()
-          .setTitle(`❓ ${q.header}`)
-          .setDescription(q.question)
-          .setColor(COLOR.QUESTION);
+        const base: OutgoingMessage = {
+          embed: {
+            title: `❓ ${q.header}`,
+            description: q.question,
+            color: COLOR.QUESTION,
+          },
+        };
 
         if (q.multiSelect && q.options.length > 0) {
-          const select = new StringSelectMenuBuilder()
-            .setCustomId(`${ID_PREFIX.ASK}${msg.toolUseId}:${q.header}`)
-            .setPlaceholder("Select options...")
-            .setMinValues(1)
-            .setMaxValues(q.options.length)
-            .addOptions(q.options.map((o) => ({
+          base.selectMenu = {
+            id: `${ID_PREFIX.ASK}${msg.toolUseId}:${q.header}`,
+            placeholder: "Select options...",
+            options: q.options.map((o) => ({
               label: o.label,
-              description: o.description || undefined,
               value: o.label,
-            })));
-          return { embeds: [embed], components: [new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(select)] };
+              description: o.description || undefined,
+            })),
+            minValues: 1,
+            maxValues: q.options.length,
+          };
+        } else {
+          base.actions = [
+            ...q.options.map((o) => ({
+              id: `${ID_PREFIX.ASK}${msg.toolUseId}:${q.header}:${o.label}`,
+              label: o.label,
+              style: "primary" as const,
+            })),
+            {
+              id: `${ID_PREFIX.ASK_OTHER}${msg.toolUseId}:${q.header}`,
+              label: "Other",
+              style: "secondary" as const,
+            },
+          ];
         }
-
-        const buttons = q.options.map((o) =>
-          new ButtonBuilder()
-            .setCustomId(`${ID_PREFIX.ASK}${msg.toolUseId}:${q.header}:${o.label}`)
-            .setLabel(o.label)
-            .setStyle(ButtonStyle.Primary)
-        );
-        buttons.push(
-          new ButtonBuilder()
-            .setCustomId(`${ID_PREFIX.ASK_OTHER}${msg.toolUseId}:${q.header}`)
-            .setLabel("Other")
-            .setStyle(ButtonStyle.Secondary)
-        );
-        return { embeds: [embed], components: [new ActionRowBuilder<ButtonBuilder>().addComponents(buttons)] };
+        return base;
       });
     }
 
     case "rewind":
-    case "turn-duration": {
-      const embed = new EmbedBuilder()
-        .setDescription(msg.content)
-        .setColor(COLOR.SYSTEM);
-      return [{ embeds: [embed] }];
-    }
+    case "turn-duration":
+      return [{
+        embed: {
+          description: msg.content,
+          color: COLOR.SYSTEM,
+        },
+      }];
 
     case "status":
-      return [{ content: msg.content }];
+      return [{ text: msg.content }];
 
     default:
       return [];
@@ -139,7 +138,7 @@ export function renderMessage(msg: ProcessedMessage): MessageCreateOptions[] {
 }
 
 /** Build thread messages for a tool result (splits long content) */
-export function renderToolResultThreadMessages(content: string, isError: boolean): MessageCreateOptions[] {
+export function renderToolResultThreadMessages(content: string, isError: boolean): { content: string }[] {
   if (!content.trim() || content === "undefined") {
     return [{ content: isError ? "❌ *(empty error)*" : "✅ *(no output)*" }];
   }
@@ -152,39 +151,23 @@ export function renderToolResultThreadMessages(content: string, isError: boolean
   }));
 }
 
-/** Build permission prompt for a thread */
-export function renderPermissionPrompt(toolUseId: string, toolName: string, content: string): MessageCreateOptions {
-  const embed = new EmbedBuilder()
-    .setTitle("⚠️ Permission needed")
-    .setDescription(`**${toolName}** ${content}`)
-    .setColor(COLOR.PERMISSION);
-
-  const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
-    new ButtonBuilder()
-      .setCustomId(`${ID_PREFIX.ALLOW}${toolUseId}`)
-      .setLabel("Allow")
-      .setStyle(ButtonStyle.Success),
-    new ButtonBuilder()
-      .setCustomId(`${ID_PREFIX.DENY}${toolUseId}`)
-      .setLabel("Deny")
-      .setStyle(ButtonStyle.Danger),
-  );
-
-  return { embeds: [embed], components: [row] };
-}
-
 // ── Batch renderer: simplified — tool results go to threads now ──
 
-export function renderBatch(messages: ProcessedMessage[]): MessageCreateOptions[] {
-  const payloads: MessageCreateOptions[] = [];
+export function renderBatch(messages: ProcessedMessage[]): OutgoingMessage[] {
+  const payloads: OutgoingMessage[] = [];
 
   for (const pm of messages) {
     // Tool results are handled via threads in daemon.ts, skip them in batch
     if (pm.type === "tool-result" || pm.type === "tool-result-error") continue;
-
-    const rendered = renderMessage(pm);
-    payloads.push(...rendered);
+    payloads.push(...renderMessage(pm));
   }
 
   return payloads;
+}
+
+/** Render a ProcessedMessage and send all parts via the provider */
+export async function sendRendered(provider: OutputProvider, pm: ProcessedMessage): Promise<void> {
+  for (const msg of renderMessage(pm)) {
+    await provider.send(msg);
+  }
 }
