@@ -26,6 +26,17 @@ let projectDir = process.cwd();
 let daemonWasEnabled = false;
 let lastChannelId: string | null = null;
 
+// ── Terminal restore (Windows ConPTY leaves win32-input-mode enabled) ──
+
+function restoreTerminal() {
+  if (process.stdin.isTTY) process.stdin.setRawMode(false);
+  // Disable win32-input-mode that ConPTY enables on Windows Terminal
+  if (process.platform === "win32") {
+    process.stdout.write("\x1b[?9001l");
+  }
+  process.stdin.unref();
+}
+
 // ── Spawn Claude in PTY ──
 
 // Set env var so the SessionStart hook only connects to THIS rc instance
@@ -56,6 +67,7 @@ process.stdout.on("resize", () => {
 });
 
 proc.onExit(({ exitCode }) => {
+  restoreTerminal();
   stopDaemon();
   cleanupPipeServer();
   setStatusFlag(false);
@@ -229,10 +241,13 @@ startPipeServer();
 // ── Graceful shutdown ──
 
 function shutdown() {
+  restoreTerminal();
   stopDaemon();
   cleanupPipeServer();
   proc.kill();
-  process.exit(0);
+  // Don't process.exit() here — let proc.onExit handle it so node-pty can clean up.
+  // Fallback exit in case the PTY doesn't fire onExit.
+  setTimeout(() => process.exit(0), 500);
 }
 
 process.on("SIGTERM", shutdown);
