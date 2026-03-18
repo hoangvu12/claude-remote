@@ -14,6 +14,24 @@ const CONFIG_FILE = path.join(CONFIG_DIR, "config.json");
 const UPDATE_CACHE = path.join(CONFIG_DIR, "update-check.json");
 const CHECK_INTERVAL = 60 * 60 * 1000; // 1 hour
 
+// Workaround for @clack/prompts spinner leaving stdin in broken state on Windows.
+// The spinner's block() function puts stdin into raw mode but never restores it on
+// Windows, which prevents all subsequent prompts from receiving keyboard input.
+// See: https://github.com/bombshell-dev/clack/issues/176
+//      https://github.com/bombshell-dev/clack/issues/408
+type Task = {
+  title: string;
+  task: (message: (string: string) => void) => string | Promise<string> | void | Promise<void>;
+  enabled?: boolean;
+};
+
+async function tasks(taskList: Task[]) {
+  await p.tasks(taskList);
+  if (process.platform === "win32" && process.stdin.isTTY) {
+    process.stdin.setRawMode(false);
+  }
+}
+
 // Read our own version from package.json
 const require = createRequire(import.meta.url);
 const PKG_NAME: string = require("../package.json").name;
@@ -372,7 +390,7 @@ async function setup() {
   let guilds: Array<{ id: string; name: string }> = [];
   let categoryId = "";
 
-  await p.tasks([
+  await tasks([
     {
       title: "Validating bot token",
       task: async (message) => {
@@ -420,7 +438,7 @@ async function setup() {
 
   const CATEGORY_NAME = "Claude RC";
 
-  await p.tasks([
+  await tasks([
     {
       title: `Setting up "${CATEGORY_NAME}" category`,
       task: async (message) => {
@@ -465,7 +483,7 @@ async function setup() {
   if (!p.isCancel(aliasSetup) && aliasSetup) {
     const targets = getAliasTargets();
 
-    await p.tasks(
+    await tasks(
       targets.map((target) => ({
         title: `${target.description} alias`,
         task: async () => {
@@ -518,7 +536,7 @@ async function uninstall() {
     process.exit(0);
   }
 
-  await p.tasks([
+  await tasks([
     {
       title: "Removing /remote skill, hooks & statusline",
       task: async () => {
