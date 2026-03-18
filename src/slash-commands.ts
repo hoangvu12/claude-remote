@@ -22,6 +22,7 @@ export interface SlashCommandDeps {
   provider: DiscordProvider;
   projectDir: string;
   sessionId: string;
+  channelId: string;
 }
 
 export async function setupSlashCommands(
@@ -99,6 +100,7 @@ export async function setupSlashCommands(
 
   client.on(Events.InteractionCreate, async (interaction) => {
     if (!interaction.isChatInputCommand()) return;
+    if (interaction.channelId !== deps.channelId) return;
     const cmd = interaction as ChatInputCommandInteraction;
     const { activity, sendToParent, getCtx } = deps;
 

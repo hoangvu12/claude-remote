@@ -209,6 +209,7 @@ async function start() {
     provider,
     projectDir,
     sessionId,
+    channelId: channel.id,
   });
 
   pipeline = createPipeline();
