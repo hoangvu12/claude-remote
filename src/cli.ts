@@ -475,7 +475,7 @@ async function setup() {
     {
       title: "Saving configuration",
       task: async () => {
-        saveConfig({ discordBotToken: finalToken, guildId, categoryId });
+        saveConfig({ discordBotToken: finalToken, guildId, categoryId, autoRemote: existing?.autoRemote });
         return `Saved to ${pc.dim(CONFIG_FILE)}`;
       },
     },
@@ -516,6 +516,22 @@ async function setup() {
     p.log.info(`Restart your terminal for the ${pc.cyan("claude")} alias to take effect.`);
   }
 
+  // ── Auto-remote setup ──
+
+  const autoRemoteSetup = await p.confirm({
+    message: `Auto-enable remote on start? (same as ${pc.bold("--remote")} flag, skips /remote on)`,
+    initialValue: existing?.autoRemote ?? false,
+  });
+
+  const autoRemote = !p.isCancel(autoRemoteSetup) && autoRemoteSetup;
+
+  // Update config with autoRemote setting
+  const savedConfig = loadConfig();
+  if (savedConfig) {
+    savedConfig.autoRemote = autoRemote;
+    saveConfig(savedConfig);
+  }
+
   // ── Summary ──
 
   const guildName = guilds.find((g) => g.id === guildId)?.name || guildId;
@@ -524,12 +540,14 @@ async function setup() {
   p.note(
     [
       `${pc.cyan(cmdName)}${" ".repeat(Math.max(1, 20 - cmdName.length))}Start Claude Code with RC support`,
+      `${pc.cyan(cmdName + " --remote")}${" ".repeat(Math.max(1, 12 - cmdName.length))}Start with remote auto-enabled`,
       `${pc.cyan("/remote on")}            Enable sync (inside a session)`,
       `${pc.cyan("/remote off")}           Disable sync`,
       "",
-      `Bot      ${pc.green(botUsername)}`,
-      `Server   ${pc.green(guildName)}`,
-      `Category ${pc.green(CATEGORY_NAME)}`,
+      `Bot         ${pc.green(botUsername)}`,
+      `Server      ${pc.green(guildName)}`,
+      `Category    ${pc.green(CATEGORY_NAME)}`,
+      `Auto-remote ${autoRemote ? pc.green("on") : pc.dim("off")}`,
       "",
       pc.dim("Each /remote on creates a new channel under the category."),
     ].join("\n"),
@@ -725,6 +743,7 @@ async function run() {
   process.env.DISCORD_BOT_TOKEN = config.discordBotToken;
   process.env.DISCORD_GUILD_ID = config.guildId;
   process.env.DISCORD_CATEGORY_ID = config.categoryId;
+  if (config.autoRemote) process.env.CLAUDE_REMOTE_AUTO = "1";
 
   // Ensure hooks & skill are up to date (idempotent, handles post-update registration)
   installHooksAndStatusline();
@@ -749,6 +768,46 @@ switch (command) {
   case "update":
     await selfUpdate();
     break;
+  case "auto": {
+    const config = loadConfig();
+    if (!config) {
+      console.log(pc.red("Not set up yet. Run ") + pc.bold("claude-remote setup") + pc.red(" first."));
+      process.exit(1);
+    }
+    config.autoRemote = !config.autoRemote;
+    saveConfig(config);
+    console.log(`  Auto-remote: ${config.autoRemote ? pc.green("on") : pc.dim("off")}`);
+    break;
+  }
+  case "config": {
+    const key = process.argv[3];
+    const value = process.argv[4];
+    const config = loadConfig();
+    if (!config) {
+      console.log(pc.red("Not set up yet. Run ") + pc.bold("claude-remote setup") + pc.red(" first."));
+      process.exit(1);
+    }
+    if (!key) {
+      // Show current config (hide token)
+      console.log(`  ${pc.dim("autoRemote")}  ${config.autoRemote ? pc.green("on") : pc.dim("off")}`);
+      break;
+    }
+    if (key === "autoRemote" || key === "auto-remote") {
+      if (!value) {
+        console.log(`autoRemote: ${config.autoRemote ? pc.green("on") : pc.dim("off")}`);
+      } else {
+        const on = ["true", "on", "1", "yes"].includes(value.toLowerCase());
+        config.autoRemote = on;
+        saveConfig(config);
+        console.log(`autoRemote: ${on ? pc.green("on") : pc.dim("off")}`);
+      }
+    } else {
+      console.log(pc.red(`Unknown config key: ${key}`));
+      console.log(`Available keys: ${pc.cyan("autoRemote")}`);
+      process.exit(1);
+    }
+    break;
+  }
   case undefined:
   case "start":
     await run();
@@ -761,10 +820,18 @@ switch (command) {
 
   ${pc.dim("Commands:")}
     ${pc.cyan("claude-remote")}              Start Claude Code with remote control
+    ${pc.cyan("claude-remote --remote")}     Start with Discord sync auto-enabled
     ${pc.cyan("claude-remote setup")}        Configure provider, install hook
+    ${pc.cyan("claude-remote auto")}         Toggle auto-remote on/off
     ${pc.cyan("claude-remote update")}       Update to the latest version
     ${pc.cyan("claude-remote uninstall")}    Remove hook and config
     ${pc.cyan("claude-remote help")}         Show this help
+
+  ${pc.dim("Options:")}
+    ${pc.cyan("--remote")}                   Auto-enable remote sync (skip /remote on)
+
+  ${pc.dim("Config keys:")}
+    ${pc.cyan("autoRemote")}  ${pc.dim("on/off")}       Always auto-enable remote on start
 `);
     break;
   default:

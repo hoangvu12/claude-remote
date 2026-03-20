@@ -67,6 +67,7 @@ export interface Config {
   discordBotToken: string;
   guildId: string;
   categoryId: string;
+  autoRemote?: boolean;
 }
 
 // ── IPC messages ──

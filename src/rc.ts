@@ -18,6 +18,7 @@ const CLAUDE_BIN = "claude.exe";
 
 const cliArgs = process.argv.slice(2);
 const initialPermissionMode = cliArgs.includes("--dangerously-skip-permissions") ? "bypassPermissions" : "default";
+const autoRemote = cliArgs.includes("--remote") || process.env.CLAUDE_REMOTE_AUTO === "1";
 
 let daemon: ChildProcess | null = null;
 let sessionId: string | null = null;
@@ -42,7 +43,10 @@ function restoreTerminal() {
 // Set env var so the SessionStart hook only connects to THIS rc instance
 process.env.CLAUDE_REMOTE_PIPE = PIPE_NAME;
 
-const proc = pty.spawn(CLAUDE_BIN, process.argv.slice(2), {
+// Strip --remote from args passed to Claude (it's our own flag)
+const claudeArgs = process.argv.slice(2).filter((a) => a !== "--remote");
+
+const proc = pty.spawn(CLAUDE_BIN, claudeArgs, {
   name: "xterm-color",
   cols: process.stdout.columns || 120,
   rows: process.stdout.rows || 30,
@@ -93,6 +97,11 @@ function startPipeServer() {
           // If daemon was running on a different session, restart it
           if (daemonWasEnabled && oldSessionId && oldSessionId !== sessionId) {
             stopDaemon();
+            startDaemon();
+          }
+
+          // Auto-enable remote if --remote flag or autoRemote config is set
+          if (autoRemote && !daemon) {
             startDaemon();
           }
 

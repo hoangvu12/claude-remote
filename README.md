@@ -40,11 +40,22 @@ Setup walks you through entering your bot token, picking your server, and instal
 
 ```bash
 claude-remote            # starts Claude Code with the remote wrapper
+claude-remote --remote   # start with Discord sync auto-enabled
 claude-remote --resume   # all args pass through to claude
 claude-remote -p "fix the login bug"
 ```
 
-Toggle the Discord sync inside a session:
+### Auto-remote
+
+Skip `/remote on` every time — auto-enable Discord sync on start:
+
+```bash
+claude-remote auto       # toggle auto-remote on/off
+```
+
+Or use `--remote` flag for a one-off: `claude-remote --remote`
+
+### Toggle sync inside a session
 
 ```
 /remote               # toggle on/off
