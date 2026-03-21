@@ -60,11 +60,152 @@ const KEY_DELAY = 150;
 const ARROW_DOWN = "\x1b[B";
 const ENTER = "\r";
 const SPACE = " ";
+const TAB = "\t";
 
-function sendKeySequence(keys: string[]) {
+function sendKeySequence(keys: string[]): number {
   keys.forEach((key, i) => {
     setTimeout(() => sendToParent({ type: "pty-write", text: key, raw: true }), i * KEY_DELAY);
   });
+  return keys.length * KEY_DELAY;
+}
+
+// ── Multi-question answer tracking ──
+// Claude Code's AskUserQuestion presents questions one at a time in the CLI.
+// Discord shows all questions at once. We collect all answers first, let the
+// user change any answer freely, and only send everything to the CLI on Submit.
+
+interface PendingAnswer {
+  /** Key sequence to send for this answer */
+  keys: string[];
+  label: string;
+  /** If set, this is a free-text "Other" answer */
+  customText?: string;
+  /** For multi-select: whether this answer uses the multi-select component (needs Tab to Submit) */
+  isMultiSelect?: boolean;
+  /** For multi-select: total number of items in the list (options + Other) */
+  multiSelectTotalItems?: number;
+  /** For multi-select: the highest selected index (to know cursor position after toggling) */
+  multiSelectLastTogglePos?: number;
+}
+
+interface AskQuestionState {
+  totalQuestions: number;
+  answers: Map<number, PendingAnswer>;
+  submitMessageId: import("./provider.js").ProviderMessage | null;
+}
+
+const askStates = new Map<string, AskQuestionState>();
+// Track option counts per question for multi-select Tab navigation
+// Key: "{toolUseId}:{questionIndex}", Value: total items in CLI list (options + "Other")
+const askOptionCounts = new Map<string, number>();
+
+function initAskState(toolUseId: string, questions: NonNullable<ProcessedMessage["questions"]>) {
+  // Store option counts for all questions (needed for multi-select Tab navigation)
+  questions.forEach((q, idx) => {
+    // CLI list has: user options + "Other" input = options.length + 1
+    askOptionCounts.set(`${toolUseId}:${idx}`, q.options.length + 1);
+  });
+  if (questions.length <= 1) return; // single question: no submit screen
+  askStates.set(toolUseId, {
+    totalQuestions: questions.length,
+    answers: new Map(),
+    submitMessageId: null,
+  });
+}
+
+function storeAskAnswer(toolUseId: string, questionIndex: number, answer: PendingAnswer) {
+  const state = askStates.get(toolUseId);
+  if (!state) return;
+  state.answers.set(questionIndex, answer);
+  showOrUpdateSubmitMessage(toolUseId);
+}
+
+async function showOrUpdateSubmitMessage(toolUseId: string) {
+  const state = askStates.get(toolUseId);
+  if (!state || !provider) return;
+
+  const allAnswered = state.answers.size >= state.totalQuestions;
+  const summary = Array.from({ length: state.totalQuestions }, (_, i) => {
+    const a = state.answers.get(i);
+    return a ? `${i + 1}. ${a.label}` : `${i + 1}. *(unanswered)*`;
+  }).join("\n");
+
+  const msg: import("./provider.js").OutgoingMessage = {
+    embed: {
+      title: allAnswered ? "Ready to submit?" : `Answers (${state.answers.size}/${state.totalQuestions})`,
+      description: summary,
+      color: COLOR.QUESTION,
+    },
+    actions: allAnswered
+      ? [
+          { id: `${ID_PREFIX.ASK_SUBMIT}${toolUseId}`, label: "Submit answers", style: "success" as const },
+          { id: `${ID_PREFIX.ASK_SUBMIT}${toolUseId}:cancel`, label: "Cancel", style: "danger" as const },
+        ]
+      : undefined,
+  };
+
+  if (state.submitMessageId) {
+    try {
+      await provider.edit(state.submitMessageId, msg);
+    } catch {
+      state.submitMessageId = await provider.send(msg);
+    }
+  } else {
+    state.submitMessageId = await provider.send(msg);
+  }
+}
+
+/** Flush all queued answers to the CLI sequentially, then submit. */
+// Extra wait between questions so the Ink UI can unmount/mount components
+const QUESTION_TRANSITION_DELAY = 600;
+
+function submitAskAnswers(toolUseId: string) {
+  const state = askStates.get(toolUseId);
+  if (!state) return;
+
+  let queueIndex = 0;
+
+  const sendNext = () => {
+    if (queueIndex >= state.totalQuestions) {
+      // All answers sent — now we're on the "Submit answers / Cancel" screen.
+      // "Submit answers" is the first option (already highlighted), press Enter.
+      setTimeout(() => sendKeySequence([ENTER]), QUESTION_TRANSITION_DELAY);
+      askStates.delete(toolUseId);
+      return;
+    }
+
+    const answer = state.answers.get(queueIndex);
+    queueIndex++;
+    if (!answer) {
+      sendNext();
+      return;
+    }
+
+    let keysDelay: number;
+    if (answer.customText != null) {
+      sendToParent({ type: "pty-write", text: answer.customText });
+      setTimeout(() => sendToParent({ type: "pty-write", text: ENTER, raw: true }), KEY_DELAY);
+      keysDelay = KEY_DELAY * 2;
+    } else if (answer.isMultiSelect) {
+      // Multi-select: send toggle keys, then Tab to reach the Submit/Next button, then Enter
+      const toggleKeys = answer.keys; // SPACE toggles at each position
+      const cursorPos = answer.multiSelectLastTogglePos ?? 0;
+      const totalItems = answer.multiSelectTotalItems ?? 1;
+      // After toggling, cursor is at `cursorPos`. Tab from there to the end (last item),
+      // then one more Tab to reach Submit button, then Enter.
+      const tabsNeeded = (totalItems - 1 - cursorPos) + 1; // tabs to last item + 1 for Submit
+      const submitKeys = [...toggleKeys];
+      for (let t = 0; t < tabsNeeded; t++) submitKeys.push(TAB);
+      submitKeys.push(ENTER);
+      keysDelay = sendKeySequence(submitKeys);
+    } else {
+      keysDelay = sendKeySequence(answer.keys);
+    }
+    // Wait for keys to finish + transition time for the next question to render
+    setTimeout(sendNext, keysDelay + QUESTION_TRANSITION_DELAY);
+  };
+
+  sendNext();
 }
 
 let reuseChannelId: string | undefined;
@@ -340,23 +481,70 @@ async function start() {
         return;
       }
 
-      if (interaction.type === "button" && id.startsWith(ID_PREFIX.ASK) && interaction.values?.[0]) {
-        // Button ID format: ask:{toolUseId}:{header}:{index}:{label}
-        const parts = id.split(":");
-        const optionIndex = parseInt(parts[3], 10);
-        const keys: string[] = [];
-        for (let i = 0; i < optionIndex; i++) keys.push(ARROW_DOWN);
-        keys.push(ENTER);
-        sendKeySequence(keys);
-        provider!.respond(interaction, { text: `Selected: **${interaction.values[0]}**` });
+      // ── Submit/Cancel for multi-question ──
+      if (interaction.type === "button" && id.startsWith(ID_PREFIX.ASK_SUBMIT)) {
+        const isCancel = id.endsWith(":cancel");
+        const toolUseId = isCancel
+          ? id.slice(ID_PREFIX.ASK_SUBMIT.length, -":cancel".length)
+          : id.slice(ID_PREFIX.ASK_SUBMIT.length);
+        if (isCancel) {
+          // Cancel: send Escape to abort the question prompt
+          sendToParent({ type: "pty-write", text: "\x1b", raw: true });
+          askStates.delete(toolUseId);
+          provider!.respond(interaction, { text: "❌ Cancelled" });
+        } else {
+          const state = askStates.get(toolUseId);
+          if (state && state.answers.size >= state.totalQuestions) {
+            submitAskAnswers(toolUseId);
+            provider!.respond(interaction, { text: "✅ Submitting answers..." });
+          } else {
+            provider!.respond(interaction, { text: "⚠️ Not all questions answered yet" });
+          }
+        }
         return;
       }
 
+      // ── Single-select question answer (button) ──
+      if (interaction.type === "button" && id.startsWith(ID_PREFIX.ASK) && interaction.values?.[0]) {
+        // Button ID format: ask:{toolUseId}:{questionIndex}:{optionIndex}:{label}
+        const parts = id.split(":");
+        const toolUseId = parts[1];
+        const questionIndex = parseInt(parts[2], 10);
+        const optionIndex = parseInt(parts[3], 10);
+        const label = parts.slice(4).join(":");
+        const keys: string[] = [];
+        for (let i = 0; i < optionIndex; i++) keys.push(ARROW_DOWN);
+        keys.push(ENTER);
+
+        const state = askStates.get(toolUseId);
+        if (state) {
+          // Multi-question: store answer (can be changed freely until Submit)
+          const existed = state.answers.has(questionIndex);
+          storeAskAnswer(toolUseId, questionIndex, { keys, label });
+          provider!.respond(interaction, {
+            text: existed
+              ? `Changed to: **${label}** (${state.answers.size}/${state.totalQuestions})`
+              : `Selected: **${label}** (${state.answers.size}/${state.totalQuestions})`,
+          });
+        } else {
+          // Single question: send immediately (no submit screen)
+          sendKeySequence(keys);
+          provider!.respond(interaction, { text: `Selected: **${label}**` });
+        }
+        return;
+      }
+
+      // ── Multi-select question answer (select menu) ──
       if (interaction.type === "select" && interaction.values?.length) {
-        // Select values are "{index}:{label}" — parse indices, navigate + toggle + submit
+        // Select menu ID format: ask:{toolUseId}:{questionIndex}
+        const menuParts = interaction.customId.split(":");
+        const toolUseId = menuParts[1];
+        const questionIndex = parseInt(menuParts[2], 10);
+
         const indices = interaction.values
           .map((v) => parseInt(v.split(":")[0], 10))
           .sort((a, b) => a - b);
+        // Build toggle-only keys (navigate + SPACE for each selection)
         const keys: string[] = [];
         let pos = 0;
         for (const idx of indices) {
@@ -364,9 +552,37 @@ async function start() {
           keys.push(SPACE);
           pos = idx;
         }
-        keys.push(ENTER);
-        sendKeySequence(keys);
-        provider!.respond(interaction, { text: `Selected: **${interaction.text}**` });
+        const label = interaction.text || "selected";
+        // Total items in CLI list = maxValues (= number of user options) + 1 ("Other" input)
+        const totalItems = (interaction.values.length > 0
+          ? Math.max(...interaction.values.map((v) => parseInt(v.split(":")[0], 10))) + 2
+          : 2); // fallback: at least options + Other
+        // Use the selectMenu's maxValues from the component if available
+        const optionCount = askOptionCounts.get(`${toolUseId}:${questionIndex}`) ?? totalItems;
+
+        const state = askStates.get(toolUseId);
+        if (state) {
+          const existed = state.answers.has(questionIndex);
+          storeAskAnswer(toolUseId, questionIndex, {
+            keys,
+            label,
+            isMultiSelect: true,
+            multiSelectTotalItems: optionCount,
+            multiSelectLastTogglePos: indices[indices.length - 1],
+          });
+          provider!.respond(interaction, {
+            text: existed
+              ? `Changed to: **${label}** (${state.answers.size}/${state.totalQuestions})`
+              : `Selected: **${label}** (${state.answers.size}/${state.totalQuestions})`,
+          });
+        } else {
+          // Single multi-select question: send toggle keys + Tab to Submit + Enter
+          const tabsNeeded = (optionCount - 1 - (indices[indices.length - 1] ?? 0)) + 1;
+          for (let t = 0; t < tabsNeeded; t++) keys.push(TAB);
+          keys.push(ENTER);
+          sendKeySequence(keys);
+          provider!.respond(interaction, { text: `Selected: **${label}**` });
+        }
         return;
       }
 
@@ -398,6 +614,31 @@ async function start() {
             provider!.respond(interaction, {
               embed: { description: "📐 Staying in plan mode", color: 0xf5a623 },
             });
+          }
+          return;
+        }
+
+        // "Other" custom answer for ask-user-question
+        if (interaction.text && id.includes(ID_PREFIX.ASK_OTHER)) {
+          // Modal ID: modal:ask-other:{toolUseId}:{questionIndex}
+          const otherParts = id.split(":");
+          const toolUseId = otherParts[2];
+          const questionIndex = parseInt(otherParts[3], 10);
+          const text = interaction.text;
+
+          const state = askStates.get(toolUseId);
+          if (state && !isNaN(questionIndex)) {
+            const existed = state.answers.has(questionIndex);
+            storeAskAnswer(toolUseId, questionIndex, { keys: [], label: text, customText: text });
+            provider!.respond(interaction, {
+              text: existed
+                ? `Changed to: **${text}** (${state.answers.size}/${state.totalQuestions})`
+                : `Answered: **${text}** (${state.answers.size}/${state.totalQuestions})`,
+            });
+          } else {
+            // Single question: send immediately
+            sendToParent({ type: "pty-write", text });
+            provider!.respond(interaction, { text: `Answered: **${text}**` });
           }
           return;
         }
@@ -495,6 +736,18 @@ async function replayHistory() {
       });
     }
 
+    // Initialize multi-question tracking for unanswered ask-user-questions in recent history
+    const answeredToolUseIds = new Set(
+      allProcessed.filter((p) => p.type === "tool-result" || p.type === "tool-result-error")
+        .map((p) => p.toolUseId).filter(Boolean),
+    );
+    for (const pm of recent) {
+      if (pm.type === "ask-user-question" && pm.questions
+          && pm.toolUseId && !answeredToolUseIds.has(pm.toolUseId)) {
+        initAskState(pm.toolUseId, pm.questions);
+      }
+    }
+
     // Send recent messages in full (batched — tool results skipped, threads not created for replay)
     for (const msg of renderBatch(recent)) {
       await provider.send(msg);
@@ -552,6 +805,10 @@ async function _flushBatch() {
 
   for (const pm of batch) {
     try {
+      // Initialize question tracking (option counts + multi-question state)
+      if (pm.type === "ask-user-question" && pm.questions && pm.toolUseId) {
+        initAskState(pm.toolUseId, pm.questions);
+      }
       await pipeline.process(pm, ctx);
     } catch (err) {
       console.error(`[daemon] Error processing ${pm.type}:`, err);

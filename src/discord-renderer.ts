@@ -103,19 +103,24 @@ export function renderMessage(msg: ProcessedMessage): OutgoingMessage[] {
 
     case "ask-user-question": {
       if (!msg.questions) return [];
+      const isMulti = msg.questions.length > 1;
 
-      return msg.questions.map((q) => {
+      return msg.questions.map((q, qIdx) => {
+        const title = isMulti
+          ? `❓ ${qIdx + 1}/${msg.questions!.length}: ${q.header}`
+          : `❓ ${q.header}`;
         const base: OutgoingMessage = {
           embed: {
-            title: `❓ ${q.header}`,
+            title,
             description: q.question,
             color: COLOR.QUESTION,
           },
         };
 
+        // ID format: ask:{toolUseId}:{questionIndex}:{optionIndex}:{label}
         if (q.multiSelect && q.options.length > 0) {
           base.selectMenu = {
-            id: `${ID_PREFIX.ASK}${msg.toolUseId}:${q.header}`,
+            id: `${ID_PREFIX.ASK}${msg.toolUseId}:${qIdx}`,
             placeholder: "Select options...",
             options: q.options.map((o, idx) => ({
               label: o.label,
@@ -128,12 +133,12 @@ export function renderMessage(msg: ProcessedMessage): OutgoingMessage[] {
         } else {
           base.actions = [
             ...q.options.map((o, idx) => ({
-              id: `${ID_PREFIX.ASK}${msg.toolUseId}:${q.header}:${idx}:${o.label}`,
+              id: `${ID_PREFIX.ASK}${msg.toolUseId}:${qIdx}:${idx}:${o.label}`,
               label: o.label,
               style: "primary" as const,
             })),
             {
-              id: `${ID_PREFIX.ASK_OTHER}${msg.toolUseId}:${q.header}`,
+              id: `${ID_PREFIX.ASK_OTHER}${msg.toolUseId}:${qIdx}`,
               label: "Other",
               style: "secondary" as const,
             },

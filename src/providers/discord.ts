@@ -184,27 +184,30 @@ export class DiscordProvider implements OutputProvider, ThreadCapable, InputCapa
         this.interactionCb?.({ type: "button", customId: id, ref: interaction });
         return;
       }
-      if (id.startsWith(ID_PREFIX.ASK)) {
-        const parts = id.split(":");
-        // Format: ask:{toolUseId}:{header}:{index}:{label}
-        const selectedLabel = parts.slice(4).join(":");
-        this.interactionCb?.({ type: "button", customId: id, values: [selectedLabel], ref: interaction });
+      if (id.startsWith(ID_PREFIX.ASK_SUBMIT)) {
+        // Submit/Cancel for multi-question — forward directly
+        this.interactionCb?.({ type: "button", customId: id, ref: interaction });
         return;
       }
       if (id.startsWith(ID_PREFIX.ASK_OTHER)) {
-        // Show modal
-        const parts = id.split(":");
-        const header = parts[2] || "Answer";
+        // Show modal for custom answer — question index is parts[2]
         const modal = new ModalBuilder()
           .setCustomId(`${ID_PREFIX.MODAL}${id}`)
           .setTitle("Custom answer");
         const textInput = new TextInputBuilder()
           .setCustomId("text")
-          .setLabel(header)
+          .setLabel("Your answer")
           .setStyle(TextInputStyle.Short)
           .setRequired(true);
         modal.addComponents(new ActionRowBuilder<TextInputBuilder>().addComponents(textInput));
         await (interaction as MessageComponentInteraction).showModal(modal);
+        return;
+      }
+      if (id.startsWith(ID_PREFIX.ASK)) {
+        const parts = id.split(":");
+        // Format: ask:{toolUseId}:{questionIndex}:{optionIndex}:{label}
+        const selectedLabel = parts.slice(4).join(":");
+        this.interactionCb?.({ type: "button", customId: id, values: [selectedLabel], ref: interaction });
         return;
       }
 

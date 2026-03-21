@@ -15,6 +15,7 @@ export const ID_PREFIX = {
   DENY: "deny:",
   ASK: "ask:",
   ASK_OTHER: "ask-other:",
+  ASK_SUBMIT: "ask-submit:",
   MODAL: "modal:",
   PLAN: "plan:",
   PLAN_FEEDBACK: "plan-feedback:",
