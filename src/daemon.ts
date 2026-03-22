@@ -824,7 +824,15 @@ async function handleFileChange(filePath: string) {
     const stat = await fd.stat();
     const newSize = stat.size;
 
-    if (newSize <= lastFileSize) {
+    if (newSize < lastFileSize) {
+      // File was rewritten (e.g. compaction) — reset offset so next append reads correctly
+      console.log(`[daemon] File shrank (${lastFileSize} → ${newSize}), resetting offset`);
+      lastFileSize = newSize;
+      await fd.close();
+      return;
+    }
+
+    if (newSize === lastFileSize) {
       await fd.close();
       return;
     }
@@ -832,9 +840,16 @@ async function handleFileChange(filePath: string) {
     const buf = Buffer.alloc(newSize - lastFileSize);
     await fd.read(buf, 0, buf.length, lastFileSize);
     await fd.close();
-    lastFileSize = newSize;
 
-    const newLines = buf.toString("utf-8").split("\n").filter(Boolean);
+    // Only advance past complete lines (ending with \n) to avoid losing
+    // partial lines that are still being written
+    const lastNL = buf.lastIndexOf(0x0A); // newline byte
+    if (lastNL === -1) return; // no complete line yet, retry on next change
+
+    const completeBytes = lastNL + 1;
+    lastFileSize += completeBytes;
+
+    const newLines = buf.subarray(0, completeBytes).toString("utf-8").split("\n").filter(Boolean);
     let rewindHandled = false; // prevent cascading rewind detection within a batch
 
     for (const line of newLines) {
