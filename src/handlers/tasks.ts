@@ -1,6 +1,7 @@
 import type { MessageHandler, SessionContext, HandlerResult } from "../handler.js";
 import type { ProcessedMessage } from "../types.js";
-import { toolState, TASK_TOOLS, type TaskInfo } from "./tool-state.js";
+import { toolState, type TaskInfo } from "./tool-state.js";
+import { TASK_TOOLS } from "../tools.js";
 import { COLOR } from "../discord-renderer.js";
 
 // ── Task embed rendering (provider-agnostic) ──

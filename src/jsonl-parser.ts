@@ -1,5 +1,6 @@
 import type { JSONLMessage, ContentBlock, ContentBlockToolUse, ProcessedMessage } from "./types.js";
 import { truncate, extractToolResultText, extractToolResultImages } from "./utils.js";
+import { HIDDEN_TOOLS, INTERACTIVE_TOOLS } from "./tools.js";
 
 export function parseJSONLString(raw: string): JSONLMessage[] {
   const messages: JSONLMessage[] = [];
@@ -97,13 +98,13 @@ export function processAssistantBlocks(msg: JSONLMessage): ProcessedMessage[] {
       const tb = block as ContentBlockToolUse;
 
       // Skip internal tools
-      if (tb.name === "ToolSearch") continue;
+      if (HIDDEN_TOOLS.has(tb.name)) continue;
       if (tb.name === "Bash") {
         const cmd = String((tb.input as Record<string, unknown>).command || "");
         if (cmd.includes("discord-cmd")) continue;
       }
 
-      if (tb.name === "AskUserQuestion") {
+      if (INTERACTIVE_TOOLS.has(tb.name)) {
         const input = tb.input as Record<string, unknown>;
         results.push({
           type: "ask-user-question",

@@ -6,13 +6,12 @@ import { toolState, type ToolEntry } from "./tool-state.js";
 import { formatToolInput } from "../format-tool.js";
 import { truncate, ID_PREFIX } from "../utils.js";
 import { COLOR } from "../discord-renderer.js";
+import { THREAD_TOOLS } from "../tools.js";
 
 /** Short window to wait for a fast result before escalating to thread */
 const FAST_RESULT_WINDOW = 300;
 /** Interval for progress updates in threads */
 const PROGRESS_INTERVAL = 15_000;
-/** Tools that always escalate to a thread immediately */
-const ALWAYS_THREAD = new Set(["Bash", "Agent"]);
 
 function formatElapsed(ms: number): string {
   const s = Math.round(ms / 1000);
@@ -95,7 +94,7 @@ export class ToolUseHandler implements MessageHandler {
     const cleanContent = pm.content.replace(/`/g, "");
     const provider = ctx.provider;
     const name = pm.toolName || "Unknown";
-    const immediate = ALWAYS_THREAD.has(name);
+    const immediate = THREAD_TOOLS.has(name);
 
     // Cache formatted input for thread context
     const inputMessages = formatToolInput(pm, COLOR.TOOL);

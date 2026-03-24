@@ -4,10 +4,11 @@ import fs from "node:fs";
 import { readFile, open } from "node:fs/promises";
 import path from "node:path";
 import os from "node:os";
+import net from "node:net";
 import { parseJSONLString, processAssistantBlocks, processUserBlocks, processNonConversation, walkCurrentBranch, getToolInputPreview } from "./jsonl-parser.js";
 import { renderBatch, COLOR } from "./discord-renderer.js";
-import { resolveJSONLPath, ID_PREFIX, CONFIG_DIR, capSet, truncate, extractToolResultText, extractToolResultImages, mimeToExt, isLocalCommand } from "./utils.js";
-import type { JSONLMessage, ProcessedMessage, ContentBlock, ContentBlockToolUse, ContentBlockText, ContentBlockToolResult, DaemonToParent, ParentToDaemon } from "./types.js";
+import { resolveJSONLPath, ID_PREFIX, CONFIG_DIR, DAEMON_PIPE_NAME, capSet, truncate, extractToolResultText, extractToolResultImages, mimeToExt, isLocalCommand, safeUnlink, createLineParser } from "./utils.js";
+import type { JSONLMessage, ProcessedMessage, ContentBlock, ContentBlockToolUse, ContentBlockText, ContentBlockToolResult, DaemonToClient, ClientToDaemon, PtyWriteMessage } from "./types.js";
 import { DiscordProvider } from "./providers/discord.js";
 import { createPipeline } from "./create-pipeline.js";
 import type { SessionContext } from "./handler.js";
@@ -15,76 +16,33 @@ import type { HandlerPipeline } from "./pipeline.js";
 import { hasInput, hasThreads } from "./provider.js";
 import { toolState } from "./handlers/tool-state.js";
 import { closePassiveGroup } from "./handlers/passive-tools.js";
+import { closeAllMcpGroups } from "./handlers/mcp-tools.js";
 import { ActivityManager } from "./activity.js";
 import { setupSlashCommands } from "./slash-commands.js";
 
-// ── State ──
+// ── Constants ──
 
-let sessionId = "";
-let projectDir = "";
-let jsonlPath = "";
-let customChannelName: string | undefined;
-let watcher: FSWatcher | null = null;
-let lastFileSize = 0;
-let lastMessageUuid: string | null = null;
-const MAX_SET_SIZE = 3000;
-let processedUuids = new Set<string>();
-let knownUuids = new Set<string>();
-
-let ctx: SessionContext | null = null;
-let pipeline: HandlerPipeline | null = null;
-let provider: DiscordProvider | null = null;
-let activity: ActivityManager | null = null;
-const tempFiles = new Set<string>();
-
-// ── Batching ──
-
+const SESSIONS_FILE = path.join(CONFIG_DIR, "sessions.json");
+const RELOAD_EXIT_CODE = 42;
 const BATCH_DELAY = 600;
-let pendingBatch: ProcessedMessage[] = [];
-let batchTimer: ReturnType<typeof setTimeout> | null = null;
-let flushPromise: Promise<void> = Promise.resolve();
-
-// ── IPC with parent (rc.ts) ──
-
-function sendToParent(msg: DaemonToParent) {
-  if (process.send) {
-    process.send(msg);
-  }
-}
-
-// ── Key sequence helper ──
-// Claude Code uses Ink select menus (arrow-key navigation) for prompts.
-// We must send keys with delays so each keypress is processed before the next.
-
 const KEY_DELAY = 150;
 const ARROW_DOWN = "\x1b[B";
 const ENTER = "\r";
 const SPACE = " ";
 const TAB = "\t";
+const REPLAY_FULL = 5;
+const SUMMARY_TEXT_LIMIT = 10;
+const MAX_SET_SIZE = 3000;
+const QUESTION_TRANSITION_DELAY = 600;
 
-function sendKeySequence(keys: string[]): number {
-  keys.forEach((key, i) => {
-    setTimeout(() => sendToParent({ type: "pty-write", text: key, raw: true }), i * KEY_DELAY);
-  });
-  return keys.length * KEY_DELAY;
-}
-
-// ── Multi-question answer tracking ──
-// Claude Code's AskUserQuestion presents questions one at a time in the CLI.
-// Discord shows all questions at once. We collect all answers first, let the
-// user change any answer freely, and only send everything to the CLI on Submit.
+// ── Multi-question types ──
 
 interface PendingAnswer {
-  /** Key sequence to send for this answer */
   keys: string[];
   label: string;
-  /** If set, this is a free-text "Other" answer */
   customText?: string;
-  /** For multi-select: whether this answer uses the multi-select component (needs Tab to Submit) */
   isMultiSelect?: boolean;
-  /** For multi-select: total number of items in the list (options + Other) */
   multiSelectTotalItems?: number;
-  /** For multi-select: the highest selected index (to know cursor position after toggling) */
   multiSelectLastTogglePos?: number;
 }
 
@@ -94,35 +52,111 @@ interface AskQuestionState {
   submitMessageId: import("./provider.js").ProviderMessage | null;
 }
 
-const askStates = new Map<string, AskQuestionState>();
-// Track option counts per question for multi-select Tab navigation
-// Key: "{toolUseId}:{questionIndex}", Value: total items in CLI list (options + "Other")
-const askOptionCounts = new Map<string, number>();
+// ── Session state ──
 
-function initAskState(toolUseId: string, questions: NonNullable<ProcessedMessage["questions"]>) {
-  // Store option counts for all questions (needed for multi-select Tab navigation)
-  questions.forEach((q, idx) => {
-    // CLI list has: user options + "Other" input = options.length + 1
-    askOptionCounts.set(`${toolUseId}:${idx}`, q.options.length + 1);
+interface Session {
+  sessionKey: string;
+  sessionId: string;
+  projectDir: string;
+  jsonlPath: string;
+  channelId: string;
+  socket: net.Socket;
+  provider: DiscordProvider;
+  activity: ActivityManager;
+  pipeline: HandlerPipeline;
+  ctx: SessionContext;
+  watcher: FSWatcher | null;
+  lastFileSize: number;
+  lastMessageUuid: string | null;
+  processedUuids: Set<string>;
+  knownUuids: Set<string>;
+  pendingBatch: ProcessedMessage[];
+  batchTimer: ReturnType<typeof setTimeout> | null;
+  flushPromise: Promise<void>;
+  askStates: Map<string, AskQuestionState>;
+  askOptionCounts: Map<string, number>;
+  lastBashOutput: Map<string, string>;
+  tempFiles: Set<string>;
+  slashCleanup: (() => void) | null;
+}
+
+// ── Daemon-level state ──
+
+let discordClient: Client | null = null;
+let guildId = "";
+let categoryId = "";
+const sessions = new Map<string, Session>();
+const channelToSessionKey = new Map<string, string>();
+let commandsRegistered = false;
+let pipeServer: net.Server | null = null;
+
+// ── Helpers ──
+
+function sendToClient(session: Session, msg: DaemonToClient) {
+  try {
+    session.socket.write(JSON.stringify(msg) + "\n");
+  } catch { /* socket may be gone */ }
+}
+
+function makePtyWriter(session: Session): (msg: Omit<PtyWriteMessage, "sessionKey">) => void {
+  return (msg) => sendToClient(session, { ...msg, sessionKey: session.sessionKey });
+}
+
+function sendKeySequence(session: Session, keys: string[]): number {
+  const write = makePtyWriter(session);
+  keys.forEach((key, i) => {
+    setTimeout(() => write({ type: "pty-write", text: key, raw: true }), i * KEY_DELAY);
   });
-  if (questions.length <= 1) return; // single question: no submit screen
-  askStates.set(toolUseId, {
+  return keys.length * KEY_DELAY;
+}
+
+// ── Session ↔ Channel mapping ──
+
+function loadSessionChannel(sid: string): string | null {
+  try {
+    const data = JSON.parse(fs.readFileSync(SESSIONS_FILE, "utf-8")) as Record<string, string>;
+    return data[sid] || null;
+  } catch {
+    return null;
+  }
+}
+
+function saveSessionChannel(sid: string, channelId: string): void {
+  try {
+    let data: Record<string, string> = {};
+    try {
+      data = JSON.parse(fs.readFileSync(SESSIONS_FILE, "utf-8"));
+    } catch { /* fresh file */ }
+    data[sid] = channelId;
+    fs.mkdirSync(path.dirname(SESSIONS_FILE), { recursive: true });
+    fs.writeFileSync(SESSIONS_FILE, JSON.stringify(data, null, 2) + "\n");
+  } catch { /* best effort */ }
+}
+
+// ── Multi-question helpers (per-session) ──
+
+function initAskState(session: Session, toolUseId: string, questions: NonNullable<ProcessedMessage["questions"]>) {
+  questions.forEach((q, idx) => {
+    session.askOptionCounts.set(`${toolUseId}:${idx}`, q.options.length + 1);
+  });
+  if (questions.length <= 1) return;
+  session.askStates.set(toolUseId, {
     totalQuestions: questions.length,
     answers: new Map(),
     submitMessageId: null,
   });
 }
 
-function storeAskAnswer(toolUseId: string, questionIndex: number, answer: PendingAnswer) {
-  const state = askStates.get(toolUseId);
+function storeAskAnswer(session: Session, toolUseId: string, questionIndex: number, answer: PendingAnswer) {
+  const state = session.askStates.get(toolUseId);
   if (!state) return;
   state.answers.set(questionIndex, answer);
-  showOrUpdateSubmitMessage(toolUseId);
+  showOrUpdateSubmitMessage(session, toolUseId);
 }
 
-async function showOrUpdateSubmitMessage(toolUseId: string) {
-  const state = askStates.get(toolUseId);
-  if (!state || !provider) return;
+async function showOrUpdateSubmitMessage(session: Session, toolUseId: string) {
+  const state = session.askStates.get(toolUseId);
+  if (!state) return;
 
   const allAnswered = state.answers.size >= state.totalQuestions;
   const summary = Array.from({ length: state.totalQuestions }, (_, i) => {
@@ -146,105 +180,980 @@ async function showOrUpdateSubmitMessage(toolUseId: string) {
 
   if (state.submitMessageId) {
     try {
-      await provider.edit(state.submitMessageId, msg);
+      await session.provider.edit(state.submitMessageId, msg);
     } catch {
-      state.submitMessageId = await provider.send(msg);
+      state.submitMessageId = await session.provider.send(msg);
     }
   } else {
-    state.submitMessageId = await provider.send(msg);
+    state.submitMessageId = await session.provider.send(msg);
   }
 }
 
-/** Flush all queued answers to the CLI sequentially, then submit. */
-// Extra wait between questions so the Ink UI can unmount/mount components
-const QUESTION_TRANSITION_DELAY = 600;
-
-function submitAskAnswers(toolUseId: string) {
-  const state = askStates.get(toolUseId);
+function submitAskAnswers(session: Session, toolUseId: string) {
+  const state = session.askStates.get(toolUseId);
   if (!state) return;
+  const write = makePtyWriter(session);
 
   let queueIndex = 0;
-
   const sendNext = () => {
     if (queueIndex >= state.totalQuestions) {
-      // All answers sent — now we're on the "Submit answers / Cancel" screen.
-      // "Submit answers" is the first option (already highlighted), press Enter.
-      setTimeout(() => sendKeySequence([ENTER]), QUESTION_TRANSITION_DELAY);
-      askStates.delete(toolUseId);
+      setTimeout(() => sendKeySequence(session, [ENTER]), QUESTION_TRANSITION_DELAY);
+      session.askStates.delete(toolUseId);
       return;
     }
-
     const answer = state.answers.get(queueIndex);
     queueIndex++;
-    if (!answer) {
-      sendNext();
-      return;
-    }
+    if (!answer) { sendNext(); return; }
 
     let keysDelay: number;
     if (answer.customText != null) {
-      sendToParent({ type: "pty-write", text: answer.customText });
-      setTimeout(() => sendToParent({ type: "pty-write", text: ENTER, raw: true }), KEY_DELAY);
+      write({ type: "pty-write", text: answer.customText });
+      setTimeout(() => write({ type: "pty-write", text: ENTER, raw: true }), KEY_DELAY);
       keysDelay = KEY_DELAY * 2;
     } else if (answer.isMultiSelect) {
-      // Multi-select: send toggle keys, then Tab to reach the Submit/Next button, then Enter
-      const toggleKeys = answer.keys; // SPACE toggles at each position
+      const toggleKeys = answer.keys;
       const cursorPos = answer.multiSelectLastTogglePos ?? 0;
       const totalItems = answer.multiSelectTotalItems ?? 1;
-      // After toggling, cursor is at `cursorPos`. Tab from there to the end (last item),
-      // then one more Tab to reach Submit button, then Enter.
-      const tabsNeeded = (totalItems - 1 - cursorPos) + 1; // tabs to last item + 1 for Submit
+      const tabsNeeded = (totalItems - 1 - cursorPos) + 1;
       const submitKeys = [...toggleKeys];
       for (let t = 0; t < tabsNeeded; t++) submitKeys.push(TAB);
       submitKeys.push(ENTER);
-      keysDelay = sendKeySequence(submitKeys);
+      keysDelay = sendKeySequence(session, submitKeys);
     } else {
-      keysDelay = sendKeySequence(answer.keys);
+      keysDelay = sendKeySequence(session, answer.keys);
     }
-    // Wait for keys to finish + transition time for the next question to render
     setTimeout(sendNext, keysDelay + QUESTION_TRANSITION_DELAY);
   };
-
   sendNext();
 }
 
-let reuseChannelId: string | undefined;
-let initialPermissionMode = "default";
+// ── JSONL message processing ──
 
-process.on("message", (msg: ParentToDaemon) => {
-  if (msg.type === "session-info") {
-    sessionId = msg.sessionId;
-    projectDir = msg.projectDir;
-    customChannelName = msg.channelName;
-    reuseChannelId = msg.reuseChannelId;
-    if (msg.initialPermissionMode) initialPermissionMode = msg.initialPermissionMode;
-    jsonlPath = msg.transcriptPath || resolveJSONLPath(sessionId, projectDir);
-    console.log(`[daemon] Session: ${sessionId}`);
-    console.log(`[daemon] JSONL: ${jsonlPath}`);
-    start();
-  } else if (msg.type === "state-signal") {
-    if (!activity) return;
-    // Stop = Claude finished responding; PostCompact manual = /compact done
-    // PostCompact auto → do nothing (Claude continues after auto-compact)
-    if (msg.event === "stop" || (msg.event === "post-compact" && msg.trigger === "manual")) {
-      activity.transitionToIdle();
+function getProcessedMessages(msg: JSONLMessage): ProcessedMessage[] {
+  if (msg.type === "assistant") return processAssistantBlocks(msg);
+  if (msg.type === "user") return processUserBlocks(msg);
+  const single = processNonConversation(msg);
+  return single ? [single] : [];
+}
+
+function dedupKey(pm: ProcessedMessage): string {
+  return pm.uuid + pm.type + (pm.toolUseId || "");
+}
+
+// ── Batch processing (per-session) ──
+
+function enqueueBatch(session: Session, pm: ProcessedMessage) {
+  session.pendingBatch.push(pm);
+  if (pm.type === "user-prompt" || pm.type === "assistant-text") {
+    if (session.batchTimer) { clearTimeout(session.batchTimer); session.batchTimer = null; }
+    flushBatch(session);
+    return;
+  }
+  if (session.batchTimer) clearTimeout(session.batchTimer);
+  session.batchTimer = setTimeout(() => flushBatch(session), BATCH_DELAY);
+}
+
+function flushBatch(session: Session) {
+  session.batchTimer = null;
+  if (session.pendingBatch.length === 0) return;
+  session.flushPromise = session.flushPromise.then(() => _flushBatch(session)).catch((err) => {
+    console.error("[daemon] Flush error:", err);
+  });
+}
+
+async function _flushBatch(session: Session) {
+  if (session.pendingBatch.length === 0) return;
+  const batch = session.pendingBatch;
+  session.pendingBatch = [];
+
+  for (const pm of batch) {
+    try {
+      if (pm.type === "ask-user-question" && pm.questions && pm.toolUseId) {
+        initAskState(session, pm.toolUseId, pm.questions);
+      }
+      await session.pipeline.process(pm, session.ctx);
+    } catch (err) {
+      console.error(`[daemon] Error processing ${pm.type}:`, err);
     }
   }
-});
+}
+
+// ── JSONL File watcher (per-session) ──
+
+function startWatcher(session: Session) {
+  session.watcher = chokidar.watch(session.jsonlPath, {
+    persistent: true,
+    awaitWriteFinish: { stabilityThreshold: 200, pollInterval: 50 },
+  });
+  session.watcher.on("change", (p) => handleFileChange(session, p));
+  session.watcher.on("error", (err: unknown) => console.error("[daemon] Watcher error:", err));
+  console.log(`[daemon] Watching JSONL: ${session.jsonlPath}`);
+}
+
+async function handleFileChange(session: Session, filePath: string) {
+  const { ctx, activity } = session;
+
+  try {
+    const fd = await open(filePath, "r");
+    const stat = await fd.stat();
+    const newSize = stat.size;
+
+    if (newSize < session.lastFileSize) {
+      console.log(`[daemon] File shrank (${session.lastFileSize} → ${newSize}), resetting offset`);
+      session.lastFileSize = newSize;
+      await fd.close();
+      return;
+    }
+    if (newSize === session.lastFileSize) { await fd.close(); return; }
+
+    const buf = Buffer.alloc(newSize - session.lastFileSize);
+    await fd.read(buf, 0, buf.length, session.lastFileSize);
+    await fd.close();
+
+    const lastNL = buf.lastIndexOf(0x0A);
+    if (lastNL === -1) return;
+    const completeBytes = lastNL + 1;
+    session.lastFileSize += completeBytes;
+
+    const newLines = buf.subarray(0, completeBytes).toString("utf-8").split("\n").filter(Boolean);
+    let rewindHandled = false;
+
+    for (const line of newLines) {
+      let msg: JSONLMessage;
+      try { msg = JSON.parse(line) as JSONLMessage; } catch { continue; }
+
+      if (msg.type === "user" && msg.permissionMode) {
+        ctx.permissionMode = msg.permissionMode;
+      }
+
+      if (msg.type === "assistant" && msg.message?.model === "<synthetic>") {
+        session.knownUuids.add(msg.uuid);
+        session.lastMessageUuid = msg.uuid;
+        continue;
+      }
+
+      if (msg.type === "user" && msg.message && Array.isArray(msg.message.content)) {
+        const isInterrupt = (msg.message.content as ContentBlock[]).some(
+          (b) => b.type === "text" && (b as ContentBlockText).text.startsWith("[Request interrupted by user"),
+        );
+        if (isInterrupt && activity) {
+          if (session.batchTimer) { clearTimeout(session.batchTimer); session.batchTimer = null; }
+          session.pendingBatch = [];
+          activity.stopOverrideUntil = Date.now() + 3000;
+          activity.transitionToIdle(3500);
+          await ctx.provider.send({ text: "⏹️ **Interrupted** from CLI" });
+          session.knownUuids.add(msg.uuid);
+          session.lastMessageUuid = msg.uuid;
+          continue;
+        }
+      }
+
+      if (activity?.busy) activity.resetIdleTimer();
+
+      if (activity && Date.now() >= activity.stopOverrideUntil) {
+        if (msg.type === "assistant" && (msg as unknown as Record<string, unknown>).isApiErrorMessage) {
+          await ctx.provider.send({
+            embed: { description: "⚠️ **API error** — request failed (Claude returned an error)", color: COLOR.ERROR_RED },
+          });
+          activity.transitionToIdle();
+        } else if (msg.type === "assistant" && msg.message && Array.isArray(msg.message.content)) {
+          const blocks = msg.message.content as ContentBlock[];
+          const hasToolUse = blocks.some((b) => b.type === "tool_use");
+          if (hasToolUse) {
+            activity.update("working");
+          } else if (blocks.some((b) => b.type === "text")) {
+            if (msg.message!.stop_reason === "max_tokens") {
+              await ctx.provider.send({
+                embed: { description: "⚠️ **Response hit token limit** — output was truncated", color: COLOR.ERROR_RED },
+              });
+            }
+            activity.transitionToIdle();
+          }
+        } else if (msg.type === "user" && msg.message && !activity.busy) {
+          const content = msg.message.content;
+          const firstText = Array.isArray(content)
+            ? (content as ContentBlock[]).find((b) => b.type === "text") as ContentBlockText | undefined
+            : undefined;
+          const text = typeof content === "string" ? content : firstText?.text || "";
+          if (!isLocalCommand(text)) {
+            activity.busy = true;
+            activity.resetIdleTimer();
+            activity.update("thinking");
+          }
+        }
+      }
+
+      if (msg.type === "system") {
+        if (msg.subtype === "api_error") {
+          const cause = (msg as unknown as Record<string, unknown>).cause as Record<string, unknown> | undefined;
+          const detail = cause?.message ? String(cause.message) : cause?.code ? String(cause.code) : "unknown error";
+          await ctx.provider.send({
+            embed: { description: `⚠️ **API error**: ${detail}`, color: COLOR.ERROR_RED },
+          });
+          if (activity) activity.transitionToIdle();
+        } else if (msg.subtype === "compact_boundary") {
+          await ctx.provider.send({ text: "🗜️ **Context compacted**" });
+        }
+        session.knownUuids.add(msg.uuid);
+        session.lastMessageUuid = msg.uuid;
+        continue;
+      }
+
+      if (msg.type === "rate_limit_event") {
+        const info = (msg as unknown as Record<string, unknown>).rate_limit_info as
+          { status?: string; resetsAt?: number; utilization?: number } | undefined;
+        if (info?.status === "rejected") {
+          const resetsIn = info.resetsAt ? Math.max(0, Math.ceil((info.resetsAt - Date.now()) / 1000)) : null;
+          const detail = resetsIn != null ? ` Resets in ${resetsIn}s` : "";
+          await ctx.provider.send({
+            embed: { description: `🚫 **Rate limited**${detail}`, color: COLOR.ERROR_RED },
+          });
+        } else if (info?.status === "allowed_warning") {
+          const pct = info.utilization != null ? ` (${Math.round(info.utilization * 100)}% used)` : "";
+          await ctx.provider.send({
+            embed: { description: `⚠️ **Approaching rate limit**${pct}`, color: 0xf5a623 },
+          });
+        }
+        continue;
+      }
+
+      if (msg.type === "auth_status") {
+        const authMsg = msg as unknown as { isAuthenticating?: boolean; error?: string };
+        if (authMsg.error) {
+          await ctx.provider.send({
+            embed: { description: `🔑 **Auth error**: ${authMsg.error}`, color: COLOR.ERROR_RED },
+          });
+        }
+        continue;
+      }
+
+      if (msg.type === "result") {
+        const result = msg as unknown as { subtype?: string; errors?: string[]; stop_reason?: string | null };
+        if (result.subtype && result.subtype !== "success") {
+          const labels: Record<string, string> = {
+            error_max_turns: "Max turns reached",
+            error_during_execution: "Error during execution",
+            error_max_budget_usd: "Budget limit reached",
+            error_max_structured_output_retries: "Structured output failed",
+          };
+          const label = labels[result.subtype] || result.subtype;
+          const detail = result.errors?.length ? `: ${result.errors[0]}` : "";
+          await ctx.provider.send({
+            embed: { description: `🛑 **${label}**${truncate(detail, 200)}`, color: COLOR.ERROR_RED },
+          });
+        }
+        if (activity) activity.transitionToIdle();
+        continue;
+      }
+
+      if (msg.type === "progress" && msg.parentToolUseID) {
+        const progressType = msg.data?.type as string | undefined;
+        if (progressType === "agent_progress") {
+          await forwardAgentProgress(session, msg);
+        } else if (progressType === "bash_progress") {
+          await forwardBashProgress(session, msg);
+        } else if (progressType === "mcp_progress") {
+          await forwardMcpProgress(session, msg);
+        }
+      }
+
+      if (
+        !rewindHandled &&
+        !msg.isSidechain &&
+        !msg.parentToolUseID &&
+        (msg.type === "assistant" || msg.type === "user") &&
+        msg.parentUuid &&
+        session.lastMessageUuid &&
+        !session.knownUuids.has(msg.parentUuid)
+      ) {
+        rewindHandled = true;
+        if (session.batchTimer) { clearTimeout(session.batchTimer); session.batchTimer = null; }
+        session.pendingBatch = [];
+        await ctx.provider.send({ text: "⏪ Conversation rewound" });
+        session.processedUuids.clear();
+        ctx.resolvedToolUseIds.clear();
+        session.knownUuids.clear();
+      }
+
+      session.knownUuids.add(msg.uuid);
+
+      if (msg.type === "user" && msg.message && Array.isArray(msg.message.content)) {
+        for (const block of msg.message.content) {
+          if (block.type === "tool_result") {
+            ctx.resolvedToolUseIds.add(block.tool_use_id);
+            session.lastBashOutput.delete(block.tool_use_id);
+          }
+        }
+      }
+
+      for (const pm of getProcessedMessages(msg)) {
+        const key = dedupKey(pm);
+        if (session.processedUuids.has(key)) continue;
+        session.processedUuids.add(key);
+        if (pm.type === "user-prompt" && ctx.originMessages.has(pm.content.trim())) {
+          ctx.originMessages.delete(pm.content.trim());
+          continue;
+        }
+        enqueueBatch(session, pm);
+      }
+
+      session.lastMessageUuid = msg.uuid;
+    }
+
+    capSet(session.processedUuids, MAX_SET_SIZE);
+    capSet(ctx.resolvedToolUseIds, MAX_SET_SIZE);
+    capSet(session.knownUuids, MAX_SET_SIZE);
+    capSet(toolState.taskToolUseIds, MAX_SET_SIZE);
+  } catch (err) {
+    console.error("[daemon] Error reading JSONL changes:", err);
+  }
+}
+
+// ── Progress forwarding (per-session) ──
+
+function getProgressThread(session: Session, parentToolUseID: string) {
+  const entry = toolState.toolUseThreads.get(parentToolUseID);
+  if (!entry?.thread || !hasThreads(session.ctx.provider)) return null;
+  return {
+    entry: entry as import("./handlers/tool-state.js").ToolEntry & { thread: import("./provider.js").ProviderThread },
+    provider: session.ctx.provider as import("./provider.js").OutputProvider & import("./provider.js").ThreadCapable,
+  };
+}
+
+async function forwardAgentProgress(session: Session, msg: JSONLMessage) {
+  const result = getProgressThread(session, msg.parentToolUseID!);
+  if (!result) return;
+  const { entry: parentEntry, provider } = result;
+
+  const innerMsg = msg.data!.message as { type: string; message?: { role: string; content: ContentBlock[] | string } } | undefined;
+  if (!innerMsg?.message) return;
+
+  const content = innerMsg.message.content;
+  if (innerMsg.type === "assistant" && Array.isArray(content)) {
+    for (const block of content as ContentBlock[]) {
+      if (block.type === "tool_use") {
+        const tb = block as ContentBlockToolUse;
+        const preview = getToolInputPreview(tb.name, tb.input);
+        await provider.sendToThread(parentEntry.thread, {
+          embed: { description: `🔧 **${tb.name}** ${preview}`, color: COLOR.TOOL },
+        });
+      } else if (block.type === "text" && (block as ContentBlockText).text.trim()) {
+        await provider.sendToThread(parentEntry.thread, {
+          text: truncate((block as ContentBlockText).text.trim(), 1900),
+        });
+      }
+    }
+  } else if (innerMsg.type === "user" && Array.isArray(content)) {
+    for (const block of content as ContentBlock[]) {
+      if (block.type === "tool_result") {
+        const tb = block as ContentBlockToolResult;
+        const resultText = extractToolResultText(tb.content).trim();
+        const images = extractToolResultImages(tb.content as Parameters<typeof extractToolResultImages>[0]);
+        const isError = !!tb.is_error;
+        const icon = isError ? "❌" : "✅";
+        if (resultText && resultText !== "undefined") {
+          await provider.sendToThread(parentEntry.thread, {
+            text: `${icon}\n\`\`\`\n${truncate(resultText, 1800)}\n\`\`\``,
+          });
+        } else {
+          await provider.sendToThread(parentEntry.thread, {
+            text: `${icon} *(no output)*`,
+          });
+        }
+        if (images.length > 0) {
+          for (let i = 0; i < images.length; i++) {
+            const img = images[i];
+            const ext = mimeToExt(img.mediaType);
+            const buf = Buffer.from(img.data, "base64");
+            if (buf.length > 8 * 1024 * 1024) continue;
+            await provider.sendToThread(parentEntry.thread, {
+              files: [{ name: `image-${i + 1}.${ext}`, data: buf }],
+            });
+          }
+        }
+      }
+    }
+  }
+}
+
+async function forwardBashProgress(session: Session, msg: JSONLMessage) {
+  const result = getProgressThread(session, msg.parentToolUseID!);
+  if (!result) return;
+  const data = msg.data as { output?: string; elapsedTimeSeconds?: number } | undefined;
+  if (!data?.output?.trim()) return;
+  const prev = session.lastBashOutput.get(msg.parentToolUseID!);
+  if (prev === data.output) return;
+  session.lastBashOutput.set(msg.parentToolUseID!, data.output);
+  await result.provider.sendToThread(result.entry.thread, {
+    text: `\`\`\`\n${truncate(data.output.trim(), 1800)}\n\`\`\``,
+  });
+}
+
+async function forwardMcpProgress(session: Session, msg: JSONLMessage) {
+  const result = getProgressThread(session, msg.parentToolUseID!);
+  if (!result) return;
+  const data = msg.data as { status?: string; serverName?: string; toolName?: string; elapsedTimeMs?: number } | undefined;
+  if (!data?.status) return;
+  if (data.status === "completed" && data.elapsedTimeMs != null) {
+    const secs = (data.elapsedTimeMs / 1000).toFixed(1);
+    await result.provider.sendToThread(result.entry.thread, {
+      text: `✅ MCP \`${data.serverName}\` completed in ${secs}s`,
+    });
+  }
+}
+
+// ── Replay history (per-session) ──
+
+async function replayHistory(session: Session) {
+  const { ctx, provider } = session;
+  await provider.cleanupThreads();
+
+  try {
+    const raw = await readFile(session.jsonlPath, "utf-8");
+    session.lastFileSize = Buffer.byteLength(raw, "utf-8");
+    const allMessages = parseJSONLString(raw);
+    const branch = walkCurrentBranch(allMessages);
+
+    for (const msg of branch) {
+      if (msg.type === "user" && msg.permissionMode) {
+        ctx.permissionMode = msg.permissionMode;
+      }
+    }
+
+    const allProcessed: ProcessedMessage[] = [];
+    for (const msg of branch) {
+      session.knownUuids.add(msg.uuid);
+      for (const pm of getProcessedMessages(msg)) {
+        session.processedUuids.add(dedupKey(pm));
+        allProcessed.push(pm);
+      }
+      session.lastMessageUuid = msg.uuid;
+    }
+
+    if (allProcessed.length === 0) return;
+
+    const splitAt = Math.max(0, allProcessed.length - REPLAY_FULL);
+    const older = allProcessed.slice(0, splitAt);
+    const recent = allProcessed.slice(splitAt);
+
+    if (older.length > 0) {
+      const textMessages: string[] = [];
+      let toolCount = 0;
+      for (const pm of older) {
+        if (pm.type === "user-prompt") {
+          textMessages.push(`**You**: ${pm.content.slice(0, 80)}${pm.content.length > 80 ? "…" : ""}`);
+        } else if (pm.type === "assistant-text") {
+          textMessages.push(`**Claude**: ${pm.content.slice(0, 100)}${pm.content.length > 100 ? "…" : ""}`);
+        } else if (pm.type === "tool-use" || pm.type === "tool-result" || pm.type === "tool-result-error") {
+          toolCount++;
+        }
+      }
+      const lines: string[] = [];
+      const shown = textMessages.slice(-SUMMARY_TEXT_LIMIT);
+      const skippedText = textMessages.length - shown.length;
+      if (skippedText > 0 || toolCount > 0) {
+        const parts: string[] = [];
+        if (skippedText > 0) parts.push(`${skippedText} earlier messages`);
+        if (toolCount > 0) parts.push(`${toolCount} tool calls`);
+        lines.push(`*… ${parts.join(", ")} not shown*\n`);
+      }
+      lines.push(...shown);
+      await provider.send({
+        embed: { title: "📜 Conversation history", description: lines.join("\n").slice(0, 4000), color: 0x2c2f33 },
+      });
+    }
+
+    const answeredToolUseIds = new Set(
+      allProcessed.filter((p) => p.type === "tool-result" || p.type === "tool-result-error")
+        .map((p) => p.toolUseId).filter(Boolean),
+    );
+    for (const pm of recent) {
+      if (pm.type === "ask-user-question" && pm.questions
+          && pm.toolUseId && !answeredToolUseIds.has(pm.toolUseId)) {
+        initAskState(session, pm.toolUseId, pm.questions);
+      }
+    }
+
+    for (const msg of renderBatch(recent)) {
+      await provider.send(msg);
+    }
+    console.log(`[daemon] Replayed: ${older.length} summarized, ${recent.length} full`);
+  } catch (err) {
+    console.log("[daemon] No existing JSONL to replay (or error):", err);
+  }
+}
+
+// ── Wire up Discord input/interactions for a session ──
+
+function wireDiscordInput(session: Session) {
+  const { provider, activity, ctx } = session;
+  const write = makePtyWriter(session);
+
+  if (hasInput(provider)) {
+    provider.onUserMessage(async (text, attachments) => {
+      console.log(`[daemon] Discord input [${session.sessionKey}]: ${text}${attachments ? ` (+${attachments.length} images)` : ""}`);
+
+      let finalText = text;
+      if (attachments?.length) {
+        const paths: string[] = [];
+        for (const att of attachments) {
+          try {
+            const resp = await fetch(att.url);
+            const buf = Buffer.from(await resp.arrayBuffer());
+            const ext = att.filename.split(".").pop() || "png";
+            const tmpPath = path.join(os.tmpdir(), `claude-remote-${Date.now()}-${Math.random().toString(36).slice(2)}.${ext}`);
+            fs.writeFileSync(tmpPath, buf);
+            session.tempFiles.add(tmpPath);
+            paths.push(tmpPath);
+          } catch (err) {
+            console.error("[daemon] Failed to download attachment:", err);
+          }
+        }
+        if (paths.length > 0) {
+          const pathList = paths.map((p) => p.replace(/\\/g, "/")).join(" ");
+          finalText = finalText
+            ? `${finalText} (see attached image: ${pathList})`
+            : `Please look at this image: ${pathList}`;
+        }
+      }
+
+      if (!finalText) return;
+
+      if (activity.busy) {
+        const msg = activity.enqueue(finalText);
+        provider.send({
+          embed: { description: `📥 Queued #${msg.id} (${activity.queue.length} in queue)\n>>> ${text.slice(0, 200)}`, color: COLOR.BLURPLE },
+        });
+        activity.update(activity.state, discordClient!);
+        return;
+      }
+      activity.busy = true;
+      activity.resetIdleTimer();
+      ctx.originMessages.add(finalText);
+      write({ type: "pty-write", text: finalText });
+      if (finalText.includes("\n")) {
+        setTimeout(() => write({ type: "pty-write", text: "\r", raw: true }), 200);
+      }
+      activity.update("thinking", discordClient!);
+    });
+
+    provider.onInteraction((interaction) => {
+      const id = interaction.customId;
+
+      if (id.startsWith(ID_PREFIX.ALLOW)) {
+        const toolUseId = id.slice(ID_PREFIX.ALLOW.length);
+        ctx.resolvedToolUseIds.add(toolUseId);
+        sendKeySequence(session, [ENTER]);
+        provider.respond(interaction, { text: "✅ Allowed" });
+        return;
+      }
+
+      if (id.startsWith(ID_PREFIX.DENY)) {
+        const toolUseId = id.slice(ID_PREFIX.DENY.length);
+        ctx.resolvedToolUseIds.add(toolUseId);
+        sendKeySequence(session, [ARROW_DOWN, ENTER]);
+        provider.respond(interaction, { text: "❌ Denied" });
+        return;
+      }
+
+      if (id.startsWith(ID_PREFIX.PLAN_FEEDBACK)) {
+        const ref = interaction.ref as MessageComponentInteraction;
+        const modal = new ModalBuilder()
+          .setCustomId(`${ID_PREFIX.MODAL}${id}`)
+          .setTitle("Keep planning");
+        const textInput = new TextInputBuilder()
+          .setCustomId("text")
+          .setLabel("What should Claude change about the plan?")
+          .setStyle(TextInputStyle.Paragraph)
+          .setRequired(false)
+          .setPlaceholder("Leave empty to just stay in plan mode");
+        modal.addComponents(new ActionRowBuilder<TextInputBuilder>().addComponents(textInput));
+        ref.showModal(modal).catch(() => {});
+        return;
+      }
+
+      if (id.startsWith(ID_PREFIX.PLAN)) {
+        const optionNum = id.slice(ID_PREFIX.PLAN.length);
+        const labels: Record<string, string> = {
+          "1": "Clear context & implement",
+          "2": "Implement (keep context)",
+          "3": "Manually approve edits",
+        };
+        write({ type: "pty-write", text: optionNum, raw: true });
+        provider.respond(interaction, {
+          embed: { description: `📐 ${labels[optionNum] || "Plan approved"}`, color: 0x43b581 },
+        });
+        return;
+      }
+
+      if (interaction.type === "button" && id.startsWith(ID_PREFIX.ASK_SUBMIT)) {
+        const isCancel = id.endsWith(":cancel");
+        const toolUseId = isCancel
+          ? id.slice(ID_PREFIX.ASK_SUBMIT.length, -":cancel".length)
+          : id.slice(ID_PREFIX.ASK_SUBMIT.length);
+        if (isCancel) {
+          write({ type: "pty-write", text: "\x1b", raw: true });
+          session.askStates.delete(toolUseId);
+          provider.respond(interaction, { text: "❌ Cancelled" });
+        } else {
+          const state = session.askStates.get(toolUseId);
+          if (state && state.answers.size >= state.totalQuestions) {
+            submitAskAnswers(session, toolUseId);
+            provider.respond(interaction, { text: "✅ Submitting answers..." });
+          } else {
+            provider.respond(interaction, { text: "⚠️ Not all questions answered yet" });
+          }
+        }
+        return;
+      }
+
+      if (interaction.type === "button" && id.startsWith(ID_PREFIX.ASK) && interaction.values?.[0]) {
+        const parts = id.split(":");
+        const toolUseId = parts[1];
+        const questionIndex = parseInt(parts[2], 10);
+        const optionIndex = parseInt(parts[3], 10);
+        const label = parts.slice(4).join(":");
+        const keys: string[] = [];
+        for (let i = 0; i < optionIndex; i++) keys.push(ARROW_DOWN);
+        keys.push(ENTER);
+
+        const state = session.askStates.get(toolUseId);
+        if (state) {
+          const existed = state.answers.has(questionIndex);
+          storeAskAnswer(session, toolUseId, questionIndex, { keys, label });
+          provider.respond(interaction, {
+            text: existed
+              ? `Changed to: **${label}** (${state.answers.size}/${state.totalQuestions})`
+              : `Selected: **${label}** (${state.answers.size}/${state.totalQuestions})`,
+          });
+        } else {
+          sendKeySequence(session, keys);
+          provider.respond(interaction, { text: `Selected: **${label}**` });
+        }
+        return;
+      }
+
+      if (interaction.type === "select" && interaction.values?.length) {
+        const menuParts = interaction.customId.split(":");
+        const toolUseId = menuParts[1];
+        const questionIndex = parseInt(menuParts[2], 10);
+        const indices = interaction.values
+          .map((v) => parseInt(v.split(":")[0], 10))
+          .sort((a, b) => a - b);
+        const keys: string[] = [];
+        let pos = 0;
+        for (const idx of indices) {
+          for (let i = pos; i < idx; i++) keys.push(ARROW_DOWN);
+          keys.push(SPACE);
+          pos = idx;
+        }
+        const label = interaction.text || "selected";
+        const totalItems = (interaction.values.length > 0
+          ? Math.max(...interaction.values.map((v) => parseInt(v.split(":")[0], 10))) + 2
+          : 2);
+        const optionCount = session.askOptionCounts.get(`${toolUseId}:${questionIndex}`) ?? totalItems;
+
+        const state = session.askStates.get(toolUseId);
+        if (state) {
+          const existed = state.answers.has(questionIndex);
+          storeAskAnswer(session, toolUseId, questionIndex, {
+            keys, label, isMultiSelect: true,
+            multiSelectTotalItems: optionCount,
+            multiSelectLastTogglePos: indices[indices.length - 1],
+          });
+          provider.respond(interaction, {
+            text: existed
+              ? `Changed to: **${label}** (${state.answers.size}/${state.totalQuestions})`
+              : `Selected: **${label}** (${state.answers.size}/${state.totalQuestions})`,
+          });
+        } else {
+          const tabsNeeded = (optionCount - 1 - (indices[indices.length - 1] ?? 0)) + 1;
+          for (let t = 0; t < tabsNeeded; t++) keys.push(TAB);
+          keys.push(ENTER);
+          sendKeySequence(session, keys);
+          provider.respond(interaction, { text: `Selected: **${label}**` });
+        }
+        return;
+      }
+
+      if (interaction.type === "modal-submit") {
+        if (id.startsWith(ID_PREFIX.QUEUE_EDIT) || id.startsWith(`${ID_PREFIX.MODAL}${ID_PREFIX.QUEUE_EDIT}`)) {
+          const prefix = id.startsWith(ID_PREFIX.QUEUE_EDIT) ? ID_PREFIX.QUEUE_EDIT : `${ID_PREFIX.MODAL}${ID_PREFIX.QUEUE_EDIT}`;
+          const queueId = parseInt(id.slice(prefix.length));
+          const item = activity.findInQueue(queueId);
+          if (item && interaction.text) {
+            item.text = interaction.text;
+            provider.respond(interaction, { text: `✏️ Queue #${queueId} updated` });
+          }
+          return;
+        }
+
+        if (id.includes(ID_PREFIX.PLAN_FEEDBACK)) {
+          const feedback = interaction.text?.trim();
+          if (feedback) {
+            write({ type: "pty-write", text: "4", raw: true });
+            setTimeout(() => {
+              write({ type: "pty-write", text: feedback, raw: true });
+              setTimeout(() => write({ type: "pty-write", text: "\r", raw: true }), 100);
+            }, 100);
+            provider.respond(interaction, {
+              embed: { description: `📐 Keep planning: ${feedback}`, color: 0xf5a623 },
+            });
+          } else {
+            write({ type: "pty-write", text: "\x1b", raw: true });
+            provider.respond(interaction, {
+              embed: { description: "📐 Staying in plan mode", color: 0xf5a623 },
+            });
+          }
+          return;
+        }
+
+        if (interaction.text && id.includes(ID_PREFIX.ASK_OTHER)) {
+          const otherParts = id.split(":");
+          const toolUseId = otherParts[2];
+          const questionIndex = parseInt(otherParts[3], 10);
+          const text = interaction.text;
+
+          const state = session.askStates.get(toolUseId);
+          if (state && !isNaN(questionIndex)) {
+            const existed = state.answers.has(questionIndex);
+            storeAskAnswer(session, toolUseId, questionIndex, { keys: [], label: text, customText: text });
+            provider.respond(interaction, {
+              text: existed
+                ? `Changed to: **${text}** (${state.answers.size}/${state.totalQuestions})`
+                : `Answered: **${text}** (${state.answers.size}/${state.totalQuestions})`,
+            });
+          } else {
+            write({ type: "pty-write", text });
+            provider.respond(interaction, { text: `Answered: **${text}**` });
+          }
+          return;
+        }
+
+        if (interaction.text) {
+          write({ type: "pty-write", text: interaction.text });
+          provider.respond(interaction, { text: `Answered: **${interaction.text}**` });
+        }
+      }
+    });
+  }
+}
+
+// ── Session lifecycle ──
+
+async function createSession(msg: ClientToDaemon & { type: "session-info" }, socket: net.Socket): Promise<void> {
+  if (!discordClient) return;
+
+  const { sessionKey, sessionId, projectDir } = msg;
+  const jsonlPath = msg.transcriptPath || resolveJSONLPath(sessionId, projectDir);
+  const reuseChannelId = msg.reuseChannelId;
+  const initialPermissionMode = msg.initialPermissionMode || "default";
+  const customChannelName = msg.channelName;
+
+  console.log(`[daemon] Creating session ${sessionKey} (session ${sessionId})`);
+
+  const guild = await discordClient.guilds.fetch(guildId);
+
+  // Resolve or create channel
+  let channel: TextChannel | null = null;
+  let isContextClear = false;
+  const savedChannelId = reuseChannelId || loadSessionChannel(sessionId);
+  if (savedChannelId) {
+    try {
+      const existing = await guild.channels.fetch(savedChannelId);
+      if (existing && existing.type === ChannelType.GuildText) {
+        channel = existing as TextChannel;
+        isContextClear = !!reuseChannelId;
+      }
+    } catch { /* channel deleted */ }
+  }
+
+  if (!channel) {
+    let channelName: string;
+    if (customChannelName) {
+      channelName = customChannelName.slice(0, 100);
+    } else {
+      const folderName = path.basename(projectDir);
+      const timestamp = new Date().toLocaleString("en-US", {
+        month: "short", day: "numeric", hour: "2-digit", minute: "2-digit", hour12: false,
+      }).toLowerCase().replace(/[,\s]+/g, "-");
+      channelName = `${folderName}-${timestamp}`.slice(0, 100);
+    }
+    channel = await guild.channels.create({
+      name: channelName,
+      type: ChannelType.GuildText,
+      parent: categoryId,
+      topic: `Claude Code session · ${projectDir} · ${sessionId.slice(0, 8)}`,
+    }) as TextChannel;
+    console.log(`[daemon] Created channel: #${channel.name}`);
+  }
+
+  saveSessionChannel(sessionId, channel.id);
+
+  // Evict old session on the same channel
+  const oldSessionKey = channelToSessionKey.get(channel.id);
+  if (oldSessionKey && oldSessionKey !== sessionKey) {
+    const oldSession = sessions.get(oldSessionKey);
+    if (oldSession) {
+      console.log(`[daemon] Evicting old session ${oldSessionKey} from channel #${channel.name}`);
+      await cleanupSession(oldSessionKey);
+    }
+  }
+  channelToSessionKey.set(channel.id, sessionKey);
+
+  // Create session object — writer callbacks use lazy `sessions.get` so
+  // sendToClient/makePtyWriter work correctly after session is registered
+  const provider = new DiscordProvider(discordClient, channel);
+  const write = makePtyWriter({ sessionKey, socket } as Session);
+  const activity = new ActivityManager(provider, write);
+  const pipeline = createPipeline();
+
+  const ctx: SessionContext = {
+    sessionId,
+    projectDir,
+    provider,
+    permissionMode: initialPermissionMode,
+    resolvedToolUseIds: new Set<string>(),
+    originMessages: new Set<string>(),
+    sendToPty: (text: string) => write({ type: "pty-write", text }),
+  };
+
+  const session: Session = {
+    sessionKey, sessionId, projectDir, jsonlPath,
+    channelId: channel.id, socket, provider, activity, pipeline, ctx,
+    watcher: null, lastFileSize: 0, lastMessageUuid: null,
+    processedUuids: new Set(), knownUuids: new Set(),
+    pendingBatch: [], batchTimer: null, flushPromise: Promise.resolve(),
+    askStates: new Map(), askOptionCounts: new Map(),
+    lastBashOutput: new Map(), tempFiles: new Set(),
+    slashCleanup: null,
+  };
+
+  sessions.set(sessionKey, session);
+
+  activity.setContext(ctx);
+  activity.onIdle(() => {
+    session.flushPromise = session.flushPromise.then(async () => {
+      await closePassiveGroup(ctx);
+      await closeAllMcpGroups(ctx);
+    }).catch(() => {});
+  });
+
+  pipeline.init(ctx);
+
+  // Setup slash commands (register only once)
+  session.slashCleanup = await setupSlashCommands(discordClient, guildId, {
+    getCtx: () => session.ctx,
+    activity,
+    sendToClient: write,
+    provider,
+    projectDir,
+    sessionId,
+    channelId: channel.id,
+  }, commandsRegistered);
+  commandsRegistered = true;
+
+  wireDiscordInput(session);
+
+  if (isContextClear) {
+    await provider.send({ text: "🧹 **Context cleared** — new conversation started" });
+  } else if (!savedChannelId) {
+    await provider.send({ text: `🟢 **Discord sync enabled**\n📁 \`${projectDir}\`\n🆔 \`${sessionId.slice(0, 8)}\`` });
+  } else {
+    await provider.send({ text: "🟢 **Discord sync reconnected**" });
+  }
+
+  sendToClient(session, { type: "daemon-ready", sessionKey, channelId: channel.id });
+  activity.update("idle", discordClient);
+
+  await replayHistory(session);
+  startWatcher(session);
+}
+
+async function cleanupSession(sessionKey: string) {
+  const session = sessions.get(sessionKey);
+  if (!session) return;
+
+  console.log(`[daemon] Cleaning up session ${sessionKey}`);
+
+  if (session.batchTimer) { clearTimeout(session.batchTimer); session.batchTimer = null; }
+  if (session.slashCleanup) session.slashCleanup();
+  session.activity.destroy();
+  session.pipeline.destroy();
+  if (session.watcher) await session.watcher.close();
+
+  for (const f of session.tempFiles) safeUnlink(f);
+
+  try { await session.provider.send({ text: "🔴 **Discord sync disabled**" }); } catch { /* gone */ }
+  await session.provider.destroy();
+
+  channelToSessionKey.delete(session.channelId);
+  sessions.delete(sessionKey);
+}
+
+// ── Pipe connection handler ──
+
+function handleConnection(socket: net.Socket) {
+  let connSessionKey: string | null = null;
+
+  socket.on("data", createLineParser((line) => {
+    let msg: ClientToDaemon;
+    try { msg = JSON.parse(line); } catch { return; }
+    connSessionKey = msg.sessionKey;
+    handleClientMessage(msg, socket);
+  }));
+
+  socket.on("close", () => {
+    if (connSessionKey) {
+      const session = sessions.get(connSessionKey);
+      if (session && session.socket === socket) {
+        cleanupSession(connSessionKey);
+      }
+    }
+  });
+
+  socket.on("error", () => {
+    // handled by close
+  });
+}
+
+async function handleClientMessage(msg: ClientToDaemon, socket: net.Socket) {
+  if (msg.type === "session-info") {
+    // If this session already exists (reconnect), clean up old one first
+    const existing = sessions.get(msg.sessionKey);
+    if (existing) {
+      await cleanupSession(msg.sessionKey);
+    }
+    try {
+      await createSession(msg, socket);
+    } catch (err) {
+      console.error("[daemon] Failed to create session:", err);
+    }
+  } else if (msg.type === "state-signal") {
+    const session = sessions.get(msg.sessionKey);
+    if (!session) return;
+    if (msg.event === "stop" || (msg.event === "post-compact" && msg.trigger === "manual")) {
+      session.activity.transitionToIdle();
+    }
+  } else if (msg.type === "session-disconnect") {
+    await cleanupSession(msg.sessionKey);
+  }
+}
 
 // ── Main startup ──
 
-async function start() {
+async function main() {
   const token = process.env.DISCORD_BOT_TOKEN;
-  const categoryId = process.env.DISCORD_CATEGORY_ID;
-  const guildId = process.env.DISCORD_GUILD_ID;
+  categoryId = process.env.DISCORD_CATEGORY_ID || "";
+  guildId = process.env.DISCORD_GUILD_ID || "";
 
   if (!token || !categoryId || !guildId) {
     console.error("[daemon] Missing DISCORD_BOT_TOKEN, DISCORD_GUILD_ID, or DISCORD_CATEGORY_ID");
     process.exit(1);
   }
 
-  const client = new Client({
+  // Single Discord client for all sessions
+  discordClient = new Client({
     intents: [
       GatewayIntentBits.Guilds,
       GatewayIntentBits.GuildMessages,
@@ -271,967 +1180,63 @@ async function start() {
     },
   });
 
-  client.on(Events.Error, (err) => console.error("[daemon] Discord error:", err));
-
-  await client.login(token);
+  discordClient.on(Events.Error, (err) => console.error("[daemon] Discord error:", err));
+  await discordClient.login(token);
   console.log("[daemon] Discord bot logged in");
 
-  const guild = await client.guilds.fetch(guildId);
+  // Verify guild access
+  const guild = await discordClient.guilds.fetch(guildId);
   if (!guild) {
     console.error("[daemon] Bot is not in the configured guild");
     process.exit(1);
   }
 
-  // Try to reuse an existing channel — prefer reuseChannelId (from /clear), then session mapping
-  let channel: TextChannel | null = null;
-  let isContextClear = false;
-  const savedChannelId = reuseChannelId || loadSessionChannel(sessionId);
-  if (savedChannelId) {
-    try {
-      const existing = await guild.channels.fetch(savedChannelId);
-      if (existing && existing.type === ChannelType.GuildText) {
-        channel = existing as TextChannel;
-        isContextClear = !!reuseChannelId;
-        console.log(`[daemon] Reusing channel: #${channel.name}${isContextClear ? " (context cleared)" : ""}`);
-      }
-    } catch {
-      // Channel was deleted, will create a new one
-    }
-  }
-
-  // Create a new channel if we couldn't reuse
-  if (!channel) {
-    let channelName: string;
-    if (customChannelName) {
-      channelName = customChannelName.slice(0, 100);
-    } else {
-      const folderName = path.basename(projectDir);
-      const timestamp = new Date().toLocaleString("en-US", {
-        month: "short", day: "numeric", hour: "2-digit", minute: "2-digit", hour12: false,
-      }).toLowerCase().replace(/[,\s]+/g, "-");
-      channelName = `${folderName}-${timestamp}`.slice(0, 100);
-    }
-
-    try {
-      channel = await guild.channels.create({
-        name: channelName,
-        type: ChannelType.GuildText,
-        parent: categoryId,
-        topic: `Claude Code session · ${projectDir} · ${sessionId.slice(0, 8)}`,
-      }) as TextChannel;
-    } catch (err) {
-      console.error("[daemon] Failed to create channel:", err);
-      process.exit(1);
-    }
-
-    console.log(`[daemon] Created channel: #${channel.name}`);
-  }
-
-  saveSessionChannel(sessionId, channel.id);
-
-  // Create provider and activity manager
-  provider = new DiscordProvider(client, channel);
-  activity = new ActivityManager(provider, sendToParent);
-
-  if (isContextClear) {
-    await provider.send({ text: "🧹 **Context cleared** — new conversation started" });
-  } else if (!savedChannelId) {
-    await provider.send({ text: `🟢 **Discord sync enabled**\n📁 \`${projectDir}\`\n🆔 \`${sessionId.slice(0, 8)}\`` });
-  } else {
-    await provider.send({ text: "🟢 **Discord sync reconnected**" });
-  }
-
-  ctx = {
-    sessionId,
-    projectDir,
-    provider,
-    permissionMode: initialPermissionMode,
-    resolvedToolUseIds: new Set<string>(),
-    originMessages: new Set<string>(),
-    sendToPty: (text: string) => sendToParent({ type: "pty-write", text }),
-  };
-
-  activity.setContext(ctx);
-  activity.onIdle(() => {
-    // Schedule on flushPromise so it runs AFTER any pending batch processing
-    flushPromise = flushPromise.then(() => closePassiveGroup(ctx!)).catch(() => {});
+  // Start pipe server
+  pipeServer = net.createServer(handleConnection);
+  pipeServer.on("error", (err) => {
+    console.error("[daemon] Pipe server error:", err);
+    process.exit(1);
   });
-
-  // Register slash commands
-  await setupSlashCommands(client, guildId, {
-    getCtx: () => ctx,
-    activity,
-    sendToParent,
-    provider,
-    projectDir,
-    sessionId,
-    channelId: channel.id,
+  pipeServer.listen(DAEMON_PIPE_NAME, () => {
+    console.log(`[daemon] Listening on ${DAEMON_PIPE_NAME}`);
+    // Write PID file so rc.ts can verify daemon is running
+    fs.mkdirSync(CONFIG_DIR, { recursive: true });
+    fs.writeFileSync(path.join(CONFIG_DIR, "daemon.pid"), String(process.pid));
   });
-
-  pipeline = createPipeline();
-  pipeline.init(ctx);
-
-  // Wire up Discord input → PTY
-  if (hasInput(provider)) {
-    provider.onUserMessage(async (text, attachments) => {
-      console.log(`[daemon] Discord input: ${text}${attachments ? ` (+${attachments.length} images)` : ""}`);
-
-      // Download image attachments to temp files and build path references
-      let finalText = text;
-      if (attachments?.length) {
-        const paths: string[] = [];
-        for (const att of attachments) {
-          try {
-            const resp = await fetch(att.url);
-            const buf = Buffer.from(await resp.arrayBuffer());
-            const ext = att.filename.split(".").pop() || "png";
-            const tmpPath = path.join(os.tmpdir(), `claude-remote-${Date.now()}-${Math.random().toString(36).slice(2)}.${ext}`);
-            fs.writeFileSync(tmpPath, buf);
-            tempFiles.add(tmpPath);
-            paths.push(tmpPath);
-          } catch (err) {
-            console.error("[daemon] Failed to download attachment:", err);
-          }
-        }
-        if (paths.length > 0) {
-          const pathList = paths.map((p) => p.replace(/\\/g, "/")).join(" ");
-          finalText = finalText
-            ? `${finalText} (see attached image: ${pathList})`
-            : `Please look at this image: ${pathList}`;
-        }
-      }
-
-      if (!finalText) return;
-
-      if (activity!.busy) {
-        const msg = activity!.enqueue(finalText);
-        provider!.send({
-          embed: {
-            description: `📥 Queued #${msg.id} (${activity!.queue.length} in queue)\n>>> ${text.slice(0, 200)}`,
-            color: COLOR.BLURPLE,
-          },
-        });
-        activity!.update(activity!.state, client);
-        return;
-      }
-      activity!.busy = true;
-      activity!.resetIdleTimer();
-      ctx!.originMessages.add(finalText);
-      sendToParent({ type: "pty-write", text: finalText });
-      // For multiline messages, submit separately after the paste is processed
-      if (finalText.includes("\n")) {
-        setTimeout(() => sendToParent({ type: "pty-write", text: "\r", raw: true }), 200);
-      }
-      activity!.update("thinking", client);
-    });
-
-    provider.onInteraction((interaction) => {
-      const id = interaction.customId;
-
-      if (id.startsWith(ID_PREFIX.ALLOW)) {
-        const toolUseId = id.slice(ID_PREFIX.ALLOW.length);
-        ctx!.resolvedToolUseIds.add(toolUseId);
-        // Allow is pre-highlighted in the select menu — just press Enter
-        sendKeySequence([ENTER]);
-        provider!.respond(interaction, { text: "✅ Allowed" });
-        return;
-      }
-
-      if (id.startsWith(ID_PREFIX.DENY)) {
-        const toolUseId = id.slice(ID_PREFIX.DENY.length);
-        ctx!.resolvedToolUseIds.add(toolUseId);
-        // Navigate down to Deny option, then press Enter
-        sendKeySequence([ARROW_DOWN, ENTER]);
-        provider!.respond(interaction, { text: "❌ Denied" });
-        return;
-      }
-
-      if (id.startsWith(ID_PREFIX.PLAN_FEEDBACK)) {
-        // "Keep planning" — show a modal for feedback text
-        const ref = interaction.ref as MessageComponentInteraction;
-        const modal = new ModalBuilder()
-          .setCustomId(`${ID_PREFIX.MODAL}${id}`)
-          .setTitle("Keep planning");
-        const textInput = new TextInputBuilder()
-          .setCustomId("text")
-          .setLabel("What should Claude change about the plan?")
-          .setStyle(TextInputStyle.Paragraph)
-          .setRequired(false)
-          .setPlaceholder("Leave empty to just stay in plan mode");
-        modal.addComponents(new ActionRowBuilder<TextInputBuilder>().addComponents(textInput));
-        ref.showModal(modal).catch(() => {});
-        return;
-      }
-
-      if (id.startsWith(ID_PREFIX.PLAN)) {
-        const optionNum = id.slice(ID_PREFIX.PLAN.length);
-        const labels: Record<string, string> = {
-          "1": "Clear context & implement",
-          "2": "Implement (keep context)",
-          "3": "Manually approve edits",
-        };
-
-        sendToParent({ type: "pty-write", text: optionNum, raw: true });
-        provider!.respond(interaction, {
-          embed: {
-            description: `📐 ${labels[optionNum] || "Plan approved"}`,
-            color: 0x43b581,
-          },
-        });
-        return;
-      }
-
-      // ── Submit/Cancel for multi-question ──
-      if (interaction.type === "button" && id.startsWith(ID_PREFIX.ASK_SUBMIT)) {
-        const isCancel = id.endsWith(":cancel");
-        const toolUseId = isCancel
-          ? id.slice(ID_PREFIX.ASK_SUBMIT.length, -":cancel".length)
-          : id.slice(ID_PREFIX.ASK_SUBMIT.length);
-        if (isCancel) {
-          // Cancel: send Escape to abort the question prompt
-          sendToParent({ type: "pty-write", text: "\x1b", raw: true });
-          askStates.delete(toolUseId);
-          provider!.respond(interaction, { text: "❌ Cancelled" });
-        } else {
-          const state = askStates.get(toolUseId);
-          if (state && state.answers.size >= state.totalQuestions) {
-            submitAskAnswers(toolUseId);
-            provider!.respond(interaction, { text: "✅ Submitting answers..." });
-          } else {
-            provider!.respond(interaction, { text: "⚠️ Not all questions answered yet" });
-          }
-        }
-        return;
-      }
-
-      // ── Single-select question answer (button) ──
-      if (interaction.type === "button" && id.startsWith(ID_PREFIX.ASK) && interaction.values?.[0]) {
-        // Button ID format: ask:{toolUseId}:{questionIndex}:{optionIndex}:{label}
-        const parts = id.split(":");
-        const toolUseId = parts[1];
-        const questionIndex = parseInt(parts[2], 10);
-        const optionIndex = parseInt(parts[3], 10);
-        const label = parts.slice(4).join(":");
-        const keys: string[] = [];
-        for (let i = 0; i < optionIndex; i++) keys.push(ARROW_DOWN);
-        keys.push(ENTER);
-
-        const state = askStates.get(toolUseId);
-        if (state) {
-          // Multi-question: store answer (can be changed freely until Submit)
-          const existed = state.answers.has(questionIndex);
-          storeAskAnswer(toolUseId, questionIndex, { keys, label });
-          provider!.respond(interaction, {
-            text: existed
-              ? `Changed to: **${label}** (${state.answers.size}/${state.totalQuestions})`
-              : `Selected: **${label}** (${state.answers.size}/${state.totalQuestions})`,
-          });
-        } else {
-          // Single question: send immediately (no submit screen)
-          sendKeySequence(keys);
-          provider!.respond(interaction, { text: `Selected: **${label}**` });
-        }
-        return;
-      }
-
-      // ── Multi-select question answer (select menu) ──
-      if (interaction.type === "select" && interaction.values?.length) {
-        // Select menu ID format: ask:{toolUseId}:{questionIndex}
-        const menuParts = interaction.customId.split(":");
-        const toolUseId = menuParts[1];
-        const questionIndex = parseInt(menuParts[2], 10);
-
-        const indices = interaction.values
-          .map((v) => parseInt(v.split(":")[0], 10))
-          .sort((a, b) => a - b);
-        // Build toggle-only keys (navigate + SPACE for each selection)
-        const keys: string[] = [];
-        let pos = 0;
-        for (const idx of indices) {
-          for (let i = pos; i < idx; i++) keys.push(ARROW_DOWN);
-          keys.push(SPACE);
-          pos = idx;
-        }
-        const label = interaction.text || "selected";
-        // Total items in CLI list = maxValues (= number of user options) + 1 ("Other" input)
-        const totalItems = (interaction.values.length > 0
-          ? Math.max(...interaction.values.map((v) => parseInt(v.split(":")[0], 10))) + 2
-          : 2); // fallback: at least options + Other
-        // Use the selectMenu's maxValues from the component if available
-        const optionCount = askOptionCounts.get(`${toolUseId}:${questionIndex}`) ?? totalItems;
-
-        const state = askStates.get(toolUseId);
-        if (state) {
-          const existed = state.answers.has(questionIndex);
-          storeAskAnswer(toolUseId, questionIndex, {
-            keys,
-            label,
-            isMultiSelect: true,
-            multiSelectTotalItems: optionCount,
-            multiSelectLastTogglePos: indices[indices.length - 1],
-          });
-          provider!.respond(interaction, {
-            text: existed
-              ? `Changed to: **${label}** (${state.answers.size}/${state.totalQuestions})`
-              : `Selected: **${label}** (${state.answers.size}/${state.totalQuestions})`,
-          });
-        } else {
-          // Single multi-select question: send toggle keys + Tab to Submit + Enter
-          const tabsNeeded = (optionCount - 1 - (indices[indices.length - 1] ?? 0)) + 1;
-          for (let t = 0; t < tabsNeeded; t++) keys.push(TAB);
-          keys.push(ENTER);
-          sendKeySequence(keys);
-          provider!.respond(interaction, { text: `Selected: **${label}**` });
-        }
-        return;
-      }
-
-      if (interaction.type === "modal-submit") {
-        if (id.startsWith(ID_PREFIX.QUEUE_EDIT) || id.startsWith(`${ID_PREFIX.MODAL}${ID_PREFIX.QUEUE_EDIT}`)) {
-          const prefix = id.startsWith(ID_PREFIX.QUEUE_EDIT) ? ID_PREFIX.QUEUE_EDIT : `${ID_PREFIX.MODAL}${ID_PREFIX.QUEUE_EDIT}`;
-          const queueId = parseInt(id.slice(prefix.length));
-          const item = activity!.findInQueue(queueId);
-          if (item && interaction.text) {
-            item.text = interaction.text;
-            provider!.respond(interaction, { text: `✏️ Queue #${queueId} updated` });
-          }
-          return;
-        }
-
-        if (id.includes(ID_PREFIX.PLAN_FEEDBACK)) {
-          const feedback = interaction.text?.trim();
-          if (feedback) {
-            sendToParent({ type: "pty-write", text: "4", raw: true });
-            setTimeout(() => {
-              sendToParent({ type: "pty-write", text: feedback, raw: true });
-              setTimeout(() => sendToParent({ type: "pty-write", text: "\r", raw: true }), 100);
-            }, 100);
-            provider!.respond(interaction, {
-              embed: { description: `📐 Keep planning: ${feedback}`, color: 0xf5a623 },
-            });
-          } else {
-            sendToParent({ type: "pty-write", text: "\x1b", raw: true });
-            provider!.respond(interaction, {
-              embed: { description: "📐 Staying in plan mode", color: 0xf5a623 },
-            });
-          }
-          return;
-        }
-
-        // "Other" custom answer for ask-user-question
-        if (interaction.text && id.includes(ID_PREFIX.ASK_OTHER)) {
-          // Modal ID: modal:ask-other:{toolUseId}:{questionIndex}
-          const otherParts = id.split(":");
-          const toolUseId = otherParts[2];
-          const questionIndex = parseInt(otherParts[3], 10);
-          const text = interaction.text;
-
-          const state = askStates.get(toolUseId);
-          if (state && !isNaN(questionIndex)) {
-            const existed = state.answers.has(questionIndex);
-            storeAskAnswer(toolUseId, questionIndex, { keys: [], label: text, customText: text });
-            provider!.respond(interaction, {
-              text: existed
-                ? `Changed to: **${text}** (${state.answers.size}/${state.totalQuestions})`
-                : `Answered: **${text}** (${state.answers.size}/${state.totalQuestions})`,
-            });
-          } else {
-            // Single question: send immediately
-            sendToParent({ type: "pty-write", text });
-            provider!.respond(interaction, { text: `Answered: **${text}**` });
-          }
-          return;
-        }
-
-        if (interaction.text) {
-          sendToParent({ type: "pty-write", text: interaction.text });
-          provider!.respond(interaction, { text: `Answered: **${interaction.text}**` });
-        }
-      }
-    });
-  }
-
-  sendToParent({ type: "daemon-ready", channelId: channel.id });
-
-  activity.update("idle", client);
-  await replayHistory();
-  startWatcher();
-}
-
-// ── Replay existing history ──
-
-const REPLAY_FULL = 5;
-const SUMMARY_TEXT_LIMIT = 10;
-
-async function replayHistory() {
-  if (!ctx || !provider) return;
-
-  await provider.cleanupThreads();
-
-  try {
-    const raw = await readFile(jsonlPath, "utf-8");
-    lastFileSize = Buffer.byteLength(raw, "utf-8");
-
-    const allMessages = parseJSONLString(raw);
-    const branch = walkCurrentBranch(allMessages);
-
-    // Track permissionMode from history
-    for (const msg of branch) {
-      if (msg.type === "user" && msg.permissionMode) {
-        ctx.permissionMode = msg.permissionMode;
-      }
-    }
-
-    // Process all for dedup tracking
-    const allProcessed: ProcessedMessage[] = [];
-    for (const msg of branch) {
-      knownUuids.add(msg.uuid);
-      for (const pm of getProcessedMessages(msg)) {
-        processedUuids.add(dedupKey(pm));
-        allProcessed.push(pm);
-      }
-      lastMessageUuid = msg.uuid;
-    }
-
-    if (allProcessed.length === 0) return;
-
-    const splitAt = Math.max(0, allProcessed.length - REPLAY_FULL);
-    const older = allProcessed.slice(0, splitAt);
-    const recent = allProcessed.slice(splitAt);
-
-    // Build a single summary message for older history
-    if (older.length > 0) {
-      const textMessages: string[] = [];
-      let toolCount = 0;
-
-      for (const pm of older) {
-        if (pm.type === "user-prompt") {
-          textMessages.push(`**You**: ${pm.content.slice(0, 80)}${pm.content.length > 80 ? "…" : ""}`);
-        } else if (pm.type === "assistant-text") {
-          textMessages.push(`**Claude**: ${pm.content.slice(0, 100)}${pm.content.length > 100 ? "…" : ""}`);
-        } else if (pm.type === "tool-use" || pm.type === "tool-result" || pm.type === "tool-result-error") {
-          toolCount++;
-        }
-      }
-
-      const lines: string[] = [];
-      const shown = textMessages.slice(-SUMMARY_TEXT_LIMIT);
-      const skippedText = textMessages.length - shown.length;
-
-      if (skippedText > 0 || toolCount > 0) {
-        const parts: string[] = [];
-        if (skippedText > 0) parts.push(`${skippedText} earlier messages`);
-        if (toolCount > 0) parts.push(`${toolCount} tool calls`);
-        lines.push(`*… ${parts.join(", ")} not shown*\n`);
-      }
-
-      lines.push(...shown);
-
-      await provider.send({
-        embed: {
-          title: "📜 Conversation history",
-          description: lines.join("\n").slice(0, 4000),
-          color: 0x2c2f33,
-        },
-      });
-    }
-
-    // Initialize multi-question tracking for unanswered ask-user-questions in recent history
-    const answeredToolUseIds = new Set(
-      allProcessed.filter((p) => p.type === "tool-result" || p.type === "tool-result-error")
-        .map((p) => p.toolUseId).filter(Boolean),
-    );
-    for (const pm of recent) {
-      if (pm.type === "ask-user-question" && pm.questions
-          && pm.toolUseId && !answeredToolUseIds.has(pm.toolUseId)) {
-        initAskState(pm.toolUseId, pm.questions);
-      }
-    }
-
-    // Send recent messages in full (batched — tool results skipped, threads not created for replay)
-    for (const msg of renderBatch(recent)) {
-      await provider.send(msg);
-    }
-
-    console.log(`[daemon] Replayed: ${older.length} summarized, ${recent.length} full`);
-  } catch (err) {
-    console.log("[daemon] No existing JSONL to replay (or error):", err);
-  }
-}
-
-// ── JSONL Watcher ──
-
-function startWatcher() {
-  watcher = chokidar.watch(jsonlPath, {
-    persistent: true,
-    awaitWriteFinish: { stabilityThreshold: 200, pollInterval: 50 },
-  });
-
-  watcher.on("change", handleFileChange);
-  watcher.on("error", (err: unknown) => console.error("[daemon] Watcher error:", err));
-  console.log("[daemon] Watching JSONL for changes");
-}
-
-function dedupKey(pm: ProcessedMessage): string {
-  return pm.uuid + pm.type + (pm.toolUseId || "");
-}
-
-function enqueueBatch(pm: ProcessedMessage) {
-  pendingBatch.push(pm);
-
-  if (pm.type === "user-prompt" || pm.type === "assistant-text") {
-    if (batchTimer) { clearTimeout(batchTimer); batchTimer = null; }
-    flushBatch();
-    return;
-  }
-
-  if (batchTimer) clearTimeout(batchTimer);
-  batchTimer = setTimeout(flushBatch, BATCH_DELAY);
-}
-
-async function flushBatch() {
-  batchTimer = null;
-  if (!ctx || pendingBatch.length === 0) return;
-  flushPromise = flushPromise.then(_flushBatch).catch((err) => {
-    console.error("[daemon] Flush error:", err);
-  });
-}
-
-async function _flushBatch() {
-  if (!ctx || !pipeline || pendingBatch.length === 0) return;
-
-  const batch = pendingBatch;
-  pendingBatch = [];
-
-  for (const pm of batch) {
-    try {
-      // Initialize question tracking (option counts + multi-question state)
-      if (pm.type === "ask-user-question" && pm.questions && pm.toolUseId) {
-        initAskState(pm.toolUseId, pm.questions);
-      }
-      await pipeline.process(pm, ctx);
-    } catch (err) {
-      console.error(`[daemon] Error processing ${pm.type}:`, err);
-    }
-  }
-}
-
-async function handleFileChange(filePath: string) {
-  if (!ctx) return;
-
-  try {
-    const fd = await open(filePath, "r");
-    const stat = await fd.stat();
-    const newSize = stat.size;
-
-    if (newSize < lastFileSize) {
-      // File was rewritten (e.g. compaction) — reset offset so next append reads correctly
-      console.log(`[daemon] File shrank (${lastFileSize} → ${newSize}), resetting offset`);
-      lastFileSize = newSize;
-      await fd.close();
-      return;
-    }
-
-    if (newSize === lastFileSize) {
-      await fd.close();
-      return;
-    }
-
-    const buf = Buffer.alloc(newSize - lastFileSize);
-    await fd.read(buf, 0, buf.length, lastFileSize);
-    await fd.close();
-
-    // Only advance past complete lines (ending with \n) to avoid losing
-    // partial lines that are still being written
-    const lastNL = buf.lastIndexOf(0x0A); // newline byte
-    if (lastNL === -1) return; // no complete line yet, retry on next change
-
-    const completeBytes = lastNL + 1;
-    lastFileSize += completeBytes;
-
-    const newLines = buf.subarray(0, completeBytes).toString("utf-8").split("\n").filter(Boolean);
-    let rewindHandled = false; // prevent cascading rewind detection within a batch
-
-    for (const line of newLines) {
-      let msg: JSONLMessage;
-      try {
-        msg = JSON.parse(line) as JSONLMessage;
-      } catch {
-        continue;
-      }
-
-      if (msg.type === "user" && msg.permissionMode) {
-        ctx.permissionMode = msg.permissionMode;
-      }
-
-      // Skip synthetic assistant messages (truncated stubs from interrupts)
-      if (msg.type === "assistant" && msg.message?.model === "<synthetic>") {
-        knownUuids.add(msg.uuid);
-        lastMessageUuid = msg.uuid;
-        continue;
-      }
-
-      // Detect user interrupt: Claude Code writes a user message with "[Request interrupted by user]"
-      if (msg.type === "user" && msg.message && Array.isArray(msg.message.content)) {
-        const isInterrupt = (msg.message.content as ContentBlock[]).some(
-          (b) => b.type === "text" && (b as ContentBlockText).text.startsWith("[Request interrupted by user"),
-        );
-        if (isInterrupt && activity) {
-          if (batchTimer) { clearTimeout(batchTimer); batchTimer = null; }
-          pendingBatch = [];
-          activity.stopOverrideUntil = Date.now() + 3000;
-          activity.transitionToIdle(3500);
-          await ctx.provider.send({ text: "⏹️ **Interrupted** from CLI" });
-          knownUuids.add(msg.uuid);
-          lastMessageUuid = msg.uuid;
-          continue;
-        }
-      }
-
-      // Any JSONL event while busy resets the idle safety timer
-      if (activity?.busy) activity.resetIdleTimer();
-
-      // Activity tracking from JSONL events (skip if recently stopped)
-      if (activity && Date.now() >= activity.stopOverrideUntil) {
-        if (msg.type === "assistant" && (msg as unknown as Record<string, unknown>).isApiErrorMessage) {
-          // API error (e.g. 500) — written as an assistant message with isApiErrorMessage: true
-          await ctx.provider.send({
-            embed: { description: "⚠️ **API error** — request failed (Claude returned an error)", color: COLOR.ERROR_RED },
-          });
-          activity.transitionToIdle();
-        } else if (msg.type === "assistant" && msg.message && Array.isArray(msg.message.content)) {
-          const blocks = msg.message.content as ContentBlock[];
-          const hasToolUse = blocks.some((b) => b.type === "tool_use");
-          if (hasToolUse) {
-            activity.update("working");
-          } else if (blocks.some((b) => b.type === "text")) {
-            // Text-only assistant message = turn complete
-            if (msg.message!.stop_reason === "max_tokens") {
-              await ctx.provider.send({
-                embed: { description: "⚠️ **Response hit token limit** — output was truncated", color: COLOR.ERROR_RED },
-              });
-            }
-            activity.transitionToIdle();
-          }
-        } else if (msg.type === "user" && msg.message && !activity.busy) {
-          const content = msg.message.content;
-          const firstText = Array.isArray(content)
-            ? (content as ContentBlock[]).find((b) => b.type === "text") as ContentBlockText | undefined
-            : undefined;
-          const text = typeof content === "string" ? content : firstText?.text || "";
-          if (!isLocalCommand(text)) {
-            activity.busy = true;
-            activity.resetIdleTimer();
-            activity.update("thinking");
-          }
-        }
-      }
-
-      // System events
-      if (msg.type === "system") {
-        if (msg.subtype === "api_error") {
-          const cause = (msg as unknown as Record<string, unknown>).cause as Record<string, unknown> | undefined;
-          const detail = cause?.message ? String(cause.message) : cause?.code ? String(cause.code) : "unknown error";
-          await ctx.provider.send({
-            embed: { description: `⚠️ **API error**: ${detail}`, color: COLOR.ERROR_RED },
-          });
-          if (activity) {
-            activity.transitionToIdle();
-          }
-        } else if (msg.subtype === "compact_boundary") {
-          await ctx.provider.send({ text: "🗜️ **Context compacted**" });
-        }
-        knownUuids.add(msg.uuid);
-        lastMessageUuid = msg.uuid;
-        continue;
-      }
-
-      // Rate limit events
-      if (msg.type === "rate_limit_event") {
-        const info = (msg as unknown as Record<string, unknown>).rate_limit_info as
-          { status?: string; resetsAt?: number; utilization?: number } | undefined;
-        if (info?.status === "rejected") {
-          const resetsIn = info.resetsAt ? Math.max(0, Math.ceil((info.resetsAt - Date.now()) / 1000)) : null;
-          const detail = resetsIn != null ? ` Resets in ${resetsIn}s` : "";
-          await ctx.provider.send({
-            embed: { description: `🚫 **Rate limited**${detail}`, color: COLOR.ERROR_RED },
-          });
-        } else if (info?.status === "allowed_warning") {
-          const pct = info.utilization != null ? ` (${Math.round(info.utilization * 100)}% used)` : "";
-          await ctx.provider.send({
-            embed: { description: `⚠️ **Approaching rate limit**${pct}`, color: 0xf5a623 },
-          });
-        }
-        continue;
-      }
-
-      // Auth errors
-      if (msg.type === "auth_status") {
-        const authMsg = msg as unknown as { isAuthenticating?: boolean; error?: string };
-        if (authMsg.error) {
-          await ctx.provider.send({
-            embed: { description: `🔑 **Auth error**: ${authMsg.error}`, color: COLOR.ERROR_RED },
-          });
-        }
-        continue;
-      }
-
-      // Result messages — authoritative turn-completion signal
-      if (msg.type === "result") {
-        const result = msg as unknown as { subtype?: string; errors?: string[]; stop_reason?: string | null };
-        if (result.subtype && result.subtype !== "success") {
-          const labels: Record<string, string> = {
-            error_max_turns: "Max turns reached",
-            error_during_execution: "Error during execution",
-            error_max_budget_usd: "Budget limit reached",
-            error_max_structured_output_retries: "Structured output failed",
-          };
-          const label = labels[result.subtype] || result.subtype;
-          const detail = result.errors?.length ? `: ${result.errors[0]}` : "";
-          await ctx.provider.send({
-            embed: { description: `🛑 **${label}**${truncate(detail, 200)}`, color: COLOR.ERROR_RED },
-          });
-        }
-        // Always transition to idle on any result (success or error)
-        if (activity) {
-          activity.transitionToIdle();
-        }
-        continue;
-      }
-
-      // Progress events → forward to parent tool's thread
-      if (msg.type === "progress" && msg.parentToolUseID) {
-        const progressType = msg.data?.type as string | undefined;
-        if (progressType === "agent_progress") {
-          await forwardAgentProgress(msg);
-        } else if (progressType === "bash_progress") {
-          await forwardBashProgress(msg);
-        } else if (progressType === "mcp_progress") {
-          await forwardMcpProgress(msg);
-        }
-      }
-
-      // Rewind detection (only once per batch to avoid cascading)
-      // Only trigger on main-chain user/assistant messages — subagent progress
-      // and sidechain messages produce parentUuids outside knownUuids normally
-      if (
-        !rewindHandled &&
-        !msg.isSidechain &&
-        !msg.parentToolUseID &&
-        (msg.type === "assistant" || msg.type === "user") &&
-        msg.parentUuid &&
-        lastMessageUuid &&
-        !knownUuids.has(msg.parentUuid)
-      ) {
-        rewindHandled = true;
-        if (batchTimer) { clearTimeout(batchTimer); batchTimer = null; }
-        pendingBatch = [];
-        await ctx.provider.send({ text: "⏪ Conversation rewound" });
-        processedUuids.clear();
-        ctx.resolvedToolUseIds.clear();
-        knownUuids.clear();
-      }
-
-      knownUuids.add(msg.uuid);
-
-      // Track tool_result arrivals and clean up associated state
-      if (msg.type === "user" && msg.message && Array.isArray(msg.message.content)) {
-        for (const block of msg.message.content) {
-          if (block.type === "tool_result") {
-            ctx.resolvedToolUseIds.add(block.tool_use_id);
-            lastBashOutput.delete(block.tool_use_id);
-          }
-        }
-      }
-
-      for (const pm of getProcessedMessages(msg)) {
-        const key = dedupKey(pm);
-        if (processedUuids.has(key)) continue;
-        processedUuids.add(key);
-
-        if (pm.type === "user-prompt" && ctx.originMessages.has(pm.content.trim())) {
-          ctx.originMessages.delete(pm.content.trim());
-          continue;
-        }
-
-        enqueueBatch(pm);
-      }
-
-      lastMessageUuid = msg.uuid;
-    }
-
-    // Cap sets to prevent unbounded growth (in-place to preserve references)
-    capSet(processedUuids, MAX_SET_SIZE);
-    capSet(ctx.resolvedToolUseIds, MAX_SET_SIZE);
-    capSet(knownUuids, MAX_SET_SIZE);
-    capSet(toolState.taskToolUseIds, MAX_SET_SIZE);
-  } catch (err) {
-    console.error("[daemon] Error reading JSONL changes:", err);
-  }
-}
-
-/** Forward sub-agent progress to the parent tool's thread */
-async function forwardAgentProgress(msg: JSONLMessage) {
-  if (!ctx) return;
-  const parentEntry = toolState.toolUseThreads.get(msg.parentToolUseID!);
-  if (!parentEntry?.thread || !hasThreads(ctx.provider)) return;
-
-  const innerMsg = msg.data!.message as { type: string; message?: { role: string; content: ContentBlock[] | string } } | undefined;
-  if (!innerMsg?.message) return;
-
-  const content = innerMsg.message.content;
-  if (innerMsg.type === "assistant" && Array.isArray(content)) {
-    for (const block of content as ContentBlock[]) {
-      if (block.type === "tool_use") {
-        const tb = block as ContentBlockToolUse;
-        const preview = getToolInputPreview(tb.name, tb.input);
-        await ctx.provider.sendToThread(parentEntry.thread, {
-          embed: { description: `🔧 **${tb.name}** ${preview}`, color: COLOR.TOOL },
-        });
-      } else if (block.type === "text" && (block as ContentBlockText).text.trim()) {
-        await ctx.provider.sendToThread(parentEntry.thread, {
-          text: truncate((block as ContentBlockText).text.trim(), 1900),
-        });
-      }
-    }
-  } else if (innerMsg.type === "user" && Array.isArray(content)) {
-    for (const block of content as ContentBlock[]) {
-      if (block.type === "tool_result") {
-        const tb = block as ContentBlockToolResult;
-        const resultText = extractToolResultText(tb.content).trim();
-        const images = extractToolResultImages(tb.content as Parameters<typeof extractToolResultImages>[0]);
-        const isError = !!tb.is_error;
-        const icon = isError ? "❌" : "✅";
-        if (resultText && resultText !== "undefined") {
-          await ctx.provider.sendToThread(parentEntry.thread, {
-            text: `${icon}\n\`\`\`\n${truncate(resultText, 1800)}\n\`\`\``,
-          });
-        } else {
-          await ctx.provider.sendToThread(parentEntry.thread, {
-            text: `${icon} *(no output)*`,
-          });
-        }
-        // Forward images from tool results
-        if (images.length > 0) {
-          for (let i = 0; i < images.length; i++) {
-            const img = images[i];
-            const ext = mimeToExt(img.mediaType);
-            const buf = Buffer.from(img.data, "base64");
-            if (buf.length > 8 * 1024 * 1024) continue;
-            await ctx.provider.sendToThread(parentEntry.thread, {
-              files: [{ name: `image-${i + 1}.${ext}`, data: buf }],
-            });
-          }
-        }
-      }
-    }
-  }
-}
-
-/** Forward bash live output to the Bash tool's thread */
-let lastBashOutput = new Map<string, string>();
-
-async function forwardBashProgress(msg: JSONLMessage) {
-  if (!ctx) return;
-  const parentEntry = toolState.toolUseThreads.get(msg.parentToolUseID!);
-  if (!parentEntry?.thread || !hasThreads(ctx.provider)) return;
-
-  const data = msg.data as { output?: string; elapsedTimeSeconds?: number } | undefined;
-  if (!data?.output?.trim()) return;
-
-  // Only send if output changed since last update (bash_progress fires every second)
-  const prev = lastBashOutput.get(msg.parentToolUseID!);
-  if (prev === data.output) return;
-  lastBashOutput.set(msg.parentToolUseID!, data.output);
-
-  await ctx.provider.sendToThread(parentEntry.thread, {
-    text: `\`\`\`\n${truncate(data.output.trim(), 1800)}\n\`\`\``,
-  });
-}
-
-/** Forward MCP tool lifecycle to the MCP tool's thread */
-async function forwardMcpProgress(msg: JSONLMessage) {
-  if (!ctx) return;
-  const parentEntry = toolState.toolUseThreads.get(msg.parentToolUseID!);
-  if (!parentEntry?.thread || !hasThreads(ctx.provider)) return;
-
-  const data = msg.data as { status?: string; serverName?: string; toolName?: string; elapsedTimeMs?: number } | undefined;
-  if (!data?.status) return;
-
-  if (data.status === "completed" && data.elapsedTimeMs != null) {
-    const secs = (data.elapsedTimeMs / 1000).toFixed(1);
-    await ctx.provider.sendToThread(parentEntry.thread, {
-      text: `✅ MCP \`${data.serverName}\` completed in ${secs}s`,
-    });
-  }
-}
-
-function getProcessedMessages(msg: JSONLMessage): ProcessedMessage[] {
-  if (msg.type === "assistant") return processAssistantBlocks(msg);
-  if (msg.type === "user") return processUserBlocks(msg);
-  const single = processNonConversation(msg);
-  return single ? [single] : [];
-}
-
-// ── Session ↔ Channel mapping ──
-
-const SESSIONS_FILE = path.join(CONFIG_DIR, "sessions.json");
-
-function loadSessionChannel(sid: string): string | null {
-  try {
-    const data = JSON.parse(fs.readFileSync(SESSIONS_FILE, "utf-8")) as Record<string, string>;
-    return data[sid] || null;
-  } catch {
-    return null;
-  }
-}
-
-function saveSessionChannel(sid: string, channelId: string): void {
-  try {
-    let data: Record<string, string> = {};
-    try {
-      data = JSON.parse(fs.readFileSync(SESSIONS_FILE, "utf-8"));
-    } catch { /* fresh file */ }
-    data[sid] = channelId;
-    fs.mkdirSync(path.dirname(SESSIONS_FILE), { recursive: true });
-    fs.writeFileSync(SESSIONS_FILE, JSON.stringify(data, null, 2) + "\n");
-  } catch { /* best effort */ }
 }
 
 // ── Hot-reload ──
-
-const RELOAD_EXIT_CODE = 42;
 
 const DAEMON_JS_PATH = path.resolve(import.meta.dirname, "daemon.js");
 fs.watchFile(DAEMON_JS_PATH, { interval: 1000 }, (curr, prev) => {
   if (curr.mtimeMs === prev.mtimeMs) return;
   console.log("[daemon] Code changed, exiting for reload...");
-  if (provider) {
-    provider.send({ text: "🔄 **Reloading...**" }).catch(() => {}).finally(() => process.exit(RELOAD_EXIT_CODE));
-  } else {
-    process.exit(RELOAD_EXIT_CODE);
+  // Notify all sessions
+  const promises: Promise<void>[] = [];
+  for (const session of sessions.values()) {
+    promises.push(session.provider.send({ text: "🔄 **Reloading...**" }).then(() => {}).catch(() => {}));
   }
+  Promise.all(promises).finally(() => process.exit(RELOAD_EXIT_CODE));
 });
 
 // ── Cleanup ──
 
-process.on("SIGTERM", cleanup);
-process.on("SIGINT", cleanup);
-process.on("disconnect", cleanup);
-
 async function cleanup() {
-  if (activity) activity.destroy();
-  if (pipeline) pipeline.destroy();
-  if (watcher) await watcher.close();
   fs.unwatchFile(DAEMON_JS_PATH);
-  // Clean up temp image files
-  for (const f of tempFiles) {
-    try { fs.unlinkSync(f); } catch { /* may already be gone */ }
-  }
-  tempFiles.clear();
-  if (provider) {
-    try { await provider.send({ text: "🔴 **Discord sync disabled**" }); } catch { /* may be gone */ }
-    await provider.destroy();
-  }
+  const cleanupPromises = Array.from(sessions.keys()).map((k) => cleanupSession(k));
+  await Promise.all(cleanupPromises);
+  if (pipeServer) pipeServer.close();
+  if (discordClient) discordClient.destroy();
+  safeUnlink(path.join(CONFIG_DIR, "daemon.pid"));
   process.exit(0);
 }
+
+process.on("SIGTERM", cleanup);
+process.on("SIGINT", cleanup);
+
+// ── Start ──
+
+main().catch((err) => {
+  console.error("[daemon] Fatal error:", err);
+  process.exit(1);
+});

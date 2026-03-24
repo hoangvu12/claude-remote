@@ -4,6 +4,7 @@ import type { ProviderThread } from "../provider.js";
 import { hasThreads, editOrSend } from "../provider.js";
 import { toolState, INLINE_RESULT_THRESHOLD } from "./tool-state.js";
 import { closePassiveGroup } from "./passive-tools.js";
+import { isMcpGroupResult, bufferMcpResult, closeAllMcpGroups } from "./mcp-tools.js";
 import { renderToolResultThreadMessages, resultColor } from "../discord-renderer.js";
 import { truncate, mimeToExt } from "../utils.js";
 
@@ -76,6 +77,14 @@ export class ToolResultHandler implements MessageHandler {
     }
 
     const isError = pm.type === "tool-result-error";
+
+    // MCP group results → buffer (group closes via non-MCP tool, text, or idle)
+    const mcpServer = isMcpGroupResult(pm.toolUseId);
+    if (mcpServer) {
+      bufferMcpResult(mcpServer, pm.toolUseId, pm.content, isError, pm.images);
+      return "consumed";
+    }
+
     const entry = toolState.toolUseThreads.get(pm.toolUseId);
     if (!entry) return "consumed"; // Edit/Write or already resolved
 
@@ -84,14 +93,14 @@ export class ToolResultHandler implements MessageHandler {
     const label = `**${entry.toolName}** — \`${truncate(entry.content, 80)}\``;
     const color = resultColor(isError);
 
-    // Passive group results → buffer, auto-close when all results are in
+    // Passive group results → buffer only; group closes via non-passive tool, text, or idle.
+    // NOT auto-closed here because sequential Read calls produce interleaved
+    // tool-use/tool-result pairs in the same batch, and eager closing would
+    // create separate "Read 1 file" threads instead of one "Read N files" thread.
     const group = toolState.activePassiveGroup;
     if (group && group.toolUseIds.has(pm.toolUseId)) {
       group.results.push({ content: pm.content, isError, images: pm.images });
       toolState.toolUseThreads.delete(pm.toolUseId);
-      if (group.results.length >= group.toolUseIds.size) {
-        await closePassiveGroup(ctx);
-      }
       return "consumed";
     }
 

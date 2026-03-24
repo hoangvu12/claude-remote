@@ -3,8 +3,7 @@ import type { ProcessedMessage } from "../types.js";
 import type { ProviderMessage } from "../provider.js";
 import { ID_PREFIX, truncate } from "../utils.js";
 import { COLOR, MAX_EMBED_DESC } from "../discord-renderer.js";
-
-const PLAN_TOOLS = new Set(["EnterPlanMode", "ExitPlanMode"]);
+import { PLAN_TOOLS } from "../tools.js";
 const COLOR_AMBER = 0xf5a623;
 
 export class PlanModeHandler implements MessageHandler {
