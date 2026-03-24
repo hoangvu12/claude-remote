@@ -70,10 +70,11 @@ export interface Config {
   autoRemote?: boolean;
 }
 
-// ── IPC messages ──
+// ── IPC messages (rc.ts ↔ daemon pipe) ──
 
 export interface PtyWriteMessage {
   type: "pty-write";
+  sessionKey: string;
   text: string;
   /** If true, write text exactly as-is without appending \r */
   raw?: boolean;
@@ -81,6 +82,7 @@ export interface PtyWriteMessage {
 
 export interface SessionInfoMessage {
   type: "session-info";
+  sessionKey: string;
   sessionId: string;
   projectDir: string;
   channelName?: string;
@@ -89,13 +91,31 @@ export interface SessionInfoMessage {
   initialPermissionMode?: string;
 }
 
+export interface SessionDisconnectMessage {
+  type: "session-disconnect";
+  sessionKey: string;
+}
+
 export interface DaemonReadyMessage {
   type: "daemon-ready";
+  sessionKey: string;
   channelId: string;
 }
 
-export type DaemonToParent = PtyWriteMessage | DaemonReadyMessage;
-export type ParentToDaemon = SessionInfoMessage | PipeStateSignalMessage;
+export interface DaemonStateSignalMessage {
+  type: "state-signal";
+  sessionKey: string;
+  event: "stop" | "post-compact";
+  trigger?: "manual" | "auto";
+}
+
+export interface DaemonRestartMessage {
+  type: "restart";
+  sessionKey: string;
+}
+
+export type DaemonToClient = PtyWriteMessage | DaemonReadyMessage | DaemonRestartMessage;
+export type ClientToDaemon = SessionInfoMessage | DaemonStateSignalMessage | SessionDisconnectMessage;
 
 // ── Named pipe messages (hook → rc) ──
 

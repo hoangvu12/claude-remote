@@ -19,6 +19,7 @@ export interface SlashCommandDeps {
   getCtx: () => SessionContext | null;
   activity: ActivityManager;
   sendToClient: (msg: Omit<PtyWriteMessage, "sessionKey">) => void;
+  restart: () => void;
   provider: DiscordProvider;
   projectDir: string;
   sessionId: string;
@@ -77,6 +78,9 @@ export async function setupSlashCommands(
     new SlashCommandBuilder()
       .setName("stop")
       .setDescription("Interrupt Claude (like pressing Escape)"),
+    new SlashCommandBuilder()
+      .setName("restart")
+      .setDescription("Restart the Claude CLI session (same args, fresh process)"),
     new SlashCommandBuilder()
       .setName("key")
       .setDescription("Send raw keypresses to Claude CLI")
@@ -181,6 +185,12 @@ export async function setupSlashCommands(
         activity.update("idle", client);
         await cmd.reply({ content: "⏹️ Interrupted", ephemeral: true });
         setTimeout(() => activity.tryDequeue(), 3500);
+        break;
+      case "restart":
+        deps.restart();
+        activity.busy = false;
+        activity.update("idle", client);
+        await cmd.reply({ content: "🔄 Restarting Claude...", ephemeral: true });
         break;
       case "key": {
         const input = cmd.options.getString("keys", true);

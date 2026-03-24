@@ -1046,6 +1046,7 @@ async function createSession(msg: ClientToDaemon & { type: "session-info" }, soc
     getCtx: () => session.ctx,
     activity,
     sendToClient: write,
+    restart: () => sendToClient(session, { type: "restart", sessionKey }),
     provider,
     projectDir,
     sessionId,

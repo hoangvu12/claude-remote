@@ -1,15 +1,17 @@
 import * as pty from "node-pty";
+import type { IPty } from "node-pty";
 import net from "node:net";
 import path from "node:path";
 import fs from "node:fs";
 import os from "node:os";
-import { fork, type ChildProcess } from "node:child_process";
-import { STATUS_FLAG, PIPE_REGISTRY, safeUnlink } from "./utils.js";
-import type { DaemonToParent, PipeMessage } from "./types.js";
+import { spawn } from "node:child_process";
+import { STATUS_FLAG, PIPE_REGISTRY, DAEMON_PIPE_NAME, safeUnlink, createLineParser } from "./utils.js";
+import type { DaemonToClient, ClientToDaemon, PipeMessage } from "./types.js";
 
 // ── Constants ──
 
-const PIPE_NAME = `\\\\.\\pipe\\claude-remote-${process.pid}`;
+const HOOK_PIPE_NAME = `\\\\.\\pipe\\claude-remote-${process.pid}`;
+const SESSION_KEY = `rc-${process.pid}`;
 
 // Use claude.exe explicitly to bypass any .cmd shim aliases we installed
 const CLAUDE_BIN = "claude.exe";
@@ -17,68 +19,85 @@ const CLAUDE_BIN = "claude.exe";
 // ── State ──
 
 const cliArgs = process.argv.slice(2);
+const claudeArgs = cliArgs.filter((a) => a !== "--remote");
 const initialPermissionMode = cliArgs.includes("--dangerously-skip-permissions") ? "bypassPermissions" : "default";
 const autoRemote = cliArgs.includes("--remote") || process.env.CLAUDE_REMOTE_AUTO === "1";
 
-let daemon: ChildProcess | null = null;
+let daemonSocket: net.Socket | null = null;
 let sessionId: string | null = null;
 let transcriptPath: string | null = null;
 let projectDir = process.cwd();
 let daemonWasEnabled = false;
 let lastChannelId: string | null = null;
+let connecting = false;
+let restarting = false;
+let proc: IPty | null = null;
 
 // ── Terminal restore (Windows ConPTY leaves win32-input-mode enabled) ──
 
 function restoreTerminal() {
   if (process.stdin.isTTY) process.stdin.setRawMode(false);
-  // Disable win32-input-mode that ConPTY enables on Windows Terminal
   if (process.platform === "win32") {
     process.stdout.write("\x1b[?9001l");
   }
   process.stdin.unref();
 }
 
+function setupTerminalInput() {
+  if (process.stdin.isTTY) {
+    process.stdin.setRawMode(true);
+  }
+  process.stdin.resume();
+}
+
 // ── Spawn Claude in PTY ──
 
-// Set env var so the SessionStart hook only connects to THIS rc instance
-process.env.CLAUDE_REMOTE_PIPE = PIPE_NAME;
+process.env.CLAUDE_REMOTE_PIPE = HOOK_PIPE_NAME;
 
-// Strip --remote from args passed to Claude (it's our own flag)
-const claudeArgs = process.argv.slice(2).filter((a) => a !== "--remote");
+function spawnClaude(): IPty {
+  const p = pty.spawn(CLAUDE_BIN, claudeArgs, {
+    name: "xterm-color",
+    cols: process.stdout.columns || 120,
+    rows: process.stdout.rows || 30,
+    cwd: projectDir,
+    env: process.env as Record<string, string>,
+  });
 
-const proc = pty.spawn(CLAUDE_BIN, claudeArgs, {
-  name: "xterm-color",
-  cols: process.stdout.columns || 120,
-  rows: process.stdout.rows || 30,
-  cwd: projectDir,
-  env: process.env as Record<string, string>,
-});
+  p.onData((data) => {
+    process.stdout.write(data);
+  });
 
-proc.onData((data) => {
-  process.stdout.write(data);
-});
+  p.onExit(({ exitCode }) => {
+    if (restarting) {
+      restarting = false;
+      sessionId = null;
+      transcriptPath = null;
+      console.log("[rc] Restarting Claude...");
+      proc = spawnClaude();
+      return;
+    }
+    restoreTerminal();
+    disconnectDaemon();
+    cleanupPipeServer();
+    setStatusFlag(false);
+    process.exit(exitCode);
+  });
 
-if (process.stdin.isTTY) {
-  process.stdin.setRawMode(true);
+  return p;
 }
-process.stdin.resume();
+
+proc = spawnClaude();
+
+setupTerminalInput();
 process.stdin.on("data", (data) => {
-  proc.write(data.toString());
+  proc?.write(data.toString());
 });
 
 process.stdout.on("resize", () => {
-  proc.resize(process.stdout.columns || 120, process.stdout.rows || 30);
+  proc?.resize(process.stdout.columns || 120, process.stdout.rows || 30);
 });
 
-proc.onExit(({ exitCode }) => {
-  restoreTerminal();
-  stopDaemon();
-  cleanupPipeServer();
-  setStatusFlag(false);
-  process.exit(exitCode);
-});
-
-// ── Named Pipe Server ──
+// ── Hook Pipe Server (hooks → rc.ts) ──
 
 let pipeServer: net.Server | null = null;
 
@@ -94,31 +113,30 @@ function startPipeServer() {
           transcriptPath = msg.transcriptPath;
           if (msg.cwd) projectDir = msg.cwd;
 
-          // If daemon was running on a different session, restart it
           if (daemonWasEnabled && oldSessionId && oldSessionId !== sessionId) {
-            stopDaemon();
-            startDaemon();
+            disconnectDaemon();
+            connectToDaemon();
           }
 
-          // Auto-enable remote if --remote flag or autoRemote config is set
-          if (autoRemote && !daemon) {
-            startDaemon();
+          if (autoRemote && !daemonSocket && !connecting) {
+            connectToDaemon();
           }
 
           socket.write(JSON.stringify({ status: "ok" }));
         } else if (msg.type === "enable") {
           if (msg.sessionId) sessionId = msg.sessionId;
-          startDaemon(msg.channelName);
+          connectToDaemon(msg.channelName);
           socket.write(JSON.stringify({ status: "ok", active: true }));
         } else if (msg.type === "disable") {
           daemonWasEnabled = false;
-          stopDaemon();
+          disconnectDaemon();
           socket.write(JSON.stringify({ status: "ok", active: false }));
         } else if (msg.type === "state-signal") {
-          if (daemon) daemon.send({ type: "state-signal", event: msg.event, trigger: msg.trigger });
+          // Relay state-signal to daemon with sessionKey
+          sendToDaemon({ type: "state-signal", sessionKey: SESSION_KEY, event: msg.event, trigger: msg.trigger });
           socket.write(JSON.stringify({ status: "ok" }));
         } else if (msg.type === "status") {
-          socket.write(JSON.stringify({ status: "ok", active: daemon !== null }));
+          socket.write(JSON.stringify({ status: "ok", active: daemonSocket !== null }));
         }
       } catch {
         socket.write(JSON.stringify({ status: "error" }));
@@ -128,10 +146,7 @@ function startPipeServer() {
   });
 
   pipeServer.on("error", () => {});
-
-  pipeServer.listen(PIPE_NAME, () => {
-    registerPipe();
-  });
+  pipeServer.listen(HOOK_PIPE_NAME, () => { registerPipe(); });
 }
 
 function registerPipe() {
@@ -139,7 +154,7 @@ function registerPipe() {
     fs.mkdirSync(PIPE_REGISTRY, { recursive: true });
     fs.writeFileSync(path.join(PIPE_REGISTRY, `${process.pid}.json`), JSON.stringify({
       pid: process.pid,
-      pipe: PIPE_NAME,
+      pipe: HOOK_PIPE_NAME,
       cwd: projectDir,
       startedAt: new Date().toISOString(),
     }));
@@ -151,10 +166,7 @@ function unregisterPipe() {
 }
 
 function cleanupPipeServer() {
-  if (pipeServer) {
-    pipeServer.close();
-    pipeServer = null;
-  }
+  if (pipeServer) { pipeServer.close(); pipeServer = null; }
   unregisterPipe();
 }
 
@@ -169,74 +181,171 @@ function setStatusFlag(active: boolean) {
   }
 }
 
-// ── Daemon management ──
+// ── Daemon connection management ──
 
 let lastChannelName: string | undefined;
 
-function startDaemon(channelName?: string) {
-  daemonWasEnabled = true;
-  if (channelName !== undefined) lastChannelName = channelName;
+function sendToDaemon(msg: ClientToDaemon) {
+  if (daemonSocket && !daemonSocket.destroyed) {
+    try {
+      daemonSocket.write(JSON.stringify(msg) + "\n");
+    } catch { /* socket gone */ }
+  }
+}
 
-  if (daemon) return;
+function handleDaemonMessage(msg: DaemonToClient) {
+  if (msg.sessionKey !== SESSION_KEY) return; // not for us
+  if (msg.type === "pty-write") {
+    if (msg.raw) {
+      proc?.write(msg.text);
+    } else if (msg.text.includes("\n")) {
+      proc?.write(`\x1b[200~${msg.text}\x1b[201~`);
+    } else {
+      proc?.write(msg.text + "\r");
+    }
+  } else if (msg.type === "daemon-ready") {
+    lastChannelId = msg.channelId;
+    setStatusFlag(true);
+  } else if (msg.type === "restart") {
+    restartClaude();
+  }
+}
 
-  if (!sessionId) return;
+function restartClaude() {
+  if (restarting || !proc) return;
+  restarting = true;
+  // Send Ctrl+C then Ctrl+D to exit Claude gracefully
+  proc.write("\x03");
+  setTimeout(() => {
+    proc?.write("\x03");
+    setTimeout(() => {
+      proc?.write("\x04");
+      // If Claude doesn't exit within 3s, force kill
+      setTimeout(() => {
+        if (restarting && proc) {
+          proc.kill();
+        }
+      }, 3000);
+    }, 300);
+  }, 300);
+}
 
+function spawnDaemon() {
   const daemonPath = path.resolve(import.meta.dirname, "daemon.js");
-
-  daemon = fork(daemonPath, [], {
+  const logDir = path.join(os.homedir(), ".claude-remote");
+  fs.mkdirSync(logDir, { recursive: true });
+  const logFd = fs.openSync(path.join(logDir, "daemon.log"), "a");
+  const child = spawn(process.execPath, [daemonPath], {
+    detached: true,
+    stdio: ["ignore", logFd, logFd],
     env: {
       ...process.env,
       DISCORD_BOT_TOKEN: process.env.DISCORD_BOT_TOKEN || "",
       DISCORD_GUILD_ID: process.env.DISCORD_GUILD_ID || "",
       DISCORD_CATEGORY_ID: process.env.DISCORD_CATEGORY_ID || "",
     },
-    stdio: ["pipe", "pipe", "pipe", "ipc"],
   });
-
-  // Log daemon output to file for debugging
-  const logStream = fs.createWriteStream(path.join(os.homedir(), ".claude-remote", "daemon.log"), { flags: "a" });
-  daemon.stdout?.pipe(logStream);
-  daemon.stderr?.pipe(logStream);
-
-  daemon.on("message", (msg: DaemonToParent) => {
-    if (msg.type === "pty-write") {
-      if (msg.raw) {
-        proc.write(msg.text);
-      } else if (msg.text.includes("\n")) {
-        // Wrap multiline text in bracketed paste so Ink treats it as a single paste
-        proc.write(`\x1b[200~${msg.text}\x1b[201~`);
-      } else {
-        proc.write(msg.text + "\r");
-      }
-    } else if (msg.type === "daemon-ready") {
-      lastChannelId = msg.channelId;
-      setStatusFlag(true);
-    }
-  });
-
-  daemon.on("exit", (code) => {
-    daemon = null;
-    // Auto-restart on hot-reload exit or unexpected crash
-    if (daemonWasEnabled && code !== null) {
-      setTimeout(() => startDaemon(lastChannelName), 1000);
-    }
-  });
-
-  daemon.on("error", () => {
-    daemon = null;
-  });
-
-  // Set status flag immediately so statusline shows On right away
-  setStatusFlag(true);
-
-  // Pass transcript path directly if we have it from the hook
-  daemon.send({ type: "session-info", sessionId, projectDir, channelName, transcriptPath, reuseChannelId: lastChannelId || undefined, initialPermissionMode });
+  child.unref();
+  fs.closeSync(logFd);
+  console.log(`[rc] Spawned daemon (PID ${child.pid})`);
 }
 
-function stopDaemon() {
-  if (!daemon) return;
-  daemon.kill("SIGTERM");
-  daemon = null;
+function connectToDaemon(channelName?: string) {
+  daemonWasEnabled = true;
+  if (channelName !== undefined) lastChannelName = channelName;
+  if (daemonSocket && !daemonSocket.destroyed) return;
+  if (!sessionId) return;
+  if (connecting) return;
+
+  connecting = true;
+
+  let attempts = 0;
+  const maxAttempts = 15;
+  let spawned = false;
+
+  const tryConnect = () => {
+    attempts++;
+    const socket = net.connect(DAEMON_PIPE_NAME);
+
+    socket.on("connect", () => {
+      connecting = false;
+      daemonSocket = socket;
+      setStatusFlag(true);
+
+      // Send session info
+      sendToDaemon({
+        type: "session-info",
+        sessionKey: SESSION_KEY,
+        sessionId: sessionId!,
+        projectDir,
+        channelName: lastChannelName,
+        transcriptPath: transcriptPath || undefined,
+        reuseChannelId: lastChannelId || undefined,
+        initialPermissionMode,
+      });
+
+      // Handle incoming messages from daemon (JSONL framing)
+      socket.on("data", createLineParser((line) => {
+        try {
+          handleDaemonMessage(JSON.parse(line) as DaemonToClient);
+        } catch { /* parse error */ }
+      }));
+
+      socket.on("close", () => {
+        // Only act if this is still the active socket (not replaced by reconnect)
+        if (daemonSocket !== socket) return;
+        daemonSocket = null;
+        setStatusFlag(false);
+        if (daemonWasEnabled) {
+          console.log("[rc] Daemon connection lost, reconnecting in 2s...");
+          setTimeout(() => connectToDaemon(lastChannelName), 2000);
+        }
+      });
+
+      socket.on("error", () => {
+        // handled by close
+      });
+    });
+
+    socket.on("error", (err: NodeJS.ErrnoException) => {
+      socket.destroy();
+      if (err.code === "ENOENT" || err.code === "ECONNREFUSED") {
+        if (!spawned) {
+          spawned = true;
+          spawnDaemon();
+        }
+        if (attempts < maxAttempts) {
+          // Backoff: 300ms, 500ms, 700ms, ...
+          const delay = 200 + attempts * 200;
+          setTimeout(tryConnect, delay);
+        } else {
+          connecting = false;
+          console.error("[rc] Failed to connect to daemon after", maxAttempts, "attempts");
+          setStatusFlag(false);
+        }
+      } else {
+        connecting = false;
+        console.error("[rc] Daemon connect error:", err.message);
+        setStatusFlag(false);
+      }
+    });
+  };
+
+  tryConnect();
+}
+
+function disconnectDaemon() {
+  daemonWasEnabled = false;
+  if (daemonSocket && !daemonSocket.destroyed) {
+    sendToDaemon({ type: "session-disconnect", sessionKey: SESSION_KEY });
+    // Store ref — clear daemonSocket first so async close handler
+    // doesn't trigger reconnect after connectToDaemon sets daemonWasEnabled=true
+    const sock = daemonSocket;
+    daemonSocket = null;
+    sock.destroy();
+  } else {
+    daemonSocket = null;
+  }
   setStatusFlag(false);
 }
 
@@ -244,18 +353,13 @@ function stopDaemon() {
 
 startPipeServer();
 
-// Hot-reload is handled by the daemon itself — it watches its own files
-// and exits with a special code. The auto-restart in daemon.on("exit") picks it up.
-
 // ── Graceful shutdown ──
 
 function shutdown() {
   restoreTerminal();
-  stopDaemon();
+  disconnectDaemon();
   cleanupPipeServer();
-  proc.kill();
-  // Don't process.exit() here — let proc.onExit handle it so node-pty can clean up.
-  // Fallback exit in case the PTY doesn't fire onExit.
+  proc?.kill();
   setTimeout(() => process.exit(0), 500);
 }
 
