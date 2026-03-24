@@ -10,7 +10,7 @@ import {
 } from "discord.js";
 import type { DiscordProvider } from "./providers/discord.js";
 import type { SessionContext } from "./handler.js";
-import type { DaemonToParent } from "./types.js";
+import type { PtyWriteMessage } from "./types.js";
 import { ActivityManager, STATUS_LABELS, type ActivityState } from "./activity.js";
 import { modeShiftTabCount, MODE_LABELS, ID_PREFIX } from "./utils.js";
 import { COLOR } from "./discord-renderer.js";
@@ -18,18 +18,20 @@ import { COLOR } from "./discord-renderer.js";
 export interface SlashCommandDeps {
   getCtx: () => SessionContext | null;
   activity: ActivityManager;
-  sendToParent: (msg: DaemonToParent) => void;
+  sendToClient: (msg: Omit<PtyWriteMessage, "sessionKey">) => void;
   provider: DiscordProvider;
   projectDir: string;
   sessionId: string;
   channelId: string;
 }
 
+/** Returns a cleanup function that removes the InteractionCreate listener */
 export async function setupSlashCommands(
   client: Client,
   guildId: string,
   deps: SlashCommandDeps,
-): Promise<void> {
+  skipRegistration = false,
+): Promise<() => void> {
   const commands = [
     new SlashCommandBuilder()
       .setName("mode")
@@ -76,6 +78,14 @@ export async function setupSlashCommands(
       .setName("stop")
       .setDescription("Interrupt Claude (like pressing Escape)"),
     new SlashCommandBuilder()
+      .setName("key")
+      .setDescription("Send raw keypresses to Claude CLI")
+      .addStringOption((opt) =>
+        opt.setName("keys")
+          .setDescription("Space-separated keys: enter, up, down, left, right, space, tab, escape, backspace, or literal text")
+          .setRequired(true)
+      ),
+    new SlashCommandBuilder()
       .setName("queue")
       .setDescription("Manage message queue")
       .addSubcommand((sub) => sub.setName("view").setDescription("View queued messages"))
@@ -90,19 +100,21 @@ export async function setupSlashCommands(
       ),
   ];
 
-  try {
-    await client.application!.commands.set(commands, guildId);
-    await client.application!.commands.set([]);
-    console.log("[daemon] Slash commands registered");
-  } catch (err) {
-    console.error("[daemon] Failed to register slash commands:", err);
+  if (!skipRegistration) {
+    try {
+      await client.application!.commands.set(commands, guildId);
+      await client.application!.commands.set([]);
+      console.log("[daemon] Slash commands registered");
+    } catch (err) {
+      console.error("[daemon] Failed to register slash commands:", err);
+    }
   }
 
-  client.on(Events.InteractionCreate, async (interaction) => {
+  const handler = async (interaction: import("discord.js").Interaction) => {
     if (!interaction.isChatInputCommand()) return;
     if (interaction.channelId !== deps.channelId) return;
     const cmd = interaction as ChatInputCommandInteraction;
-    const { activity, sendToParent, getCtx } = deps;
+    const { activity, sendToClient, getCtx } = deps;
 
     switch (cmd.commandName) {
       case "mode": {
@@ -117,7 +129,7 @@ export async function setupSlashCommands(
         // Send each Shift+Tab with a delay so Claude Code has time to process each one
         for (let i = 0; i < presses; i++) {
           if (i > 0) await new Promise((r) => setTimeout(r, 500));
-          sendToParent({ type: "pty-write", text: SHIFT_TAB, raw: true });
+          sendToClient({ type: "pty-write", text: SHIFT_TAB, raw: true });
         }
         // Optimistically update tracked mode — JSONL won't reflect the change until next user message
         const ctx = getCtx();
@@ -126,7 +138,7 @@ export async function setupSlashCommands(
         break;
       }
       case "clear":
-        sendToParent({ type: "pty-write", text: "/clear", raw: false });
+        sendToClient({ type: "pty-write", text: "/clear", raw: false });
         activity.busy = false;
         activity.update("idle", client);
         await cmd.reply({ content: "🧹 Clearing context...", ephemeral: true });
@@ -149,7 +161,7 @@ export async function setupSlashCommands(
       case "compact": {
         const instructions = cmd.options.getString("instructions");
         const text = instructions ? `/compact ${instructions}` : "/compact";
-        sendToParent({ type: "pty-write", text, raw: false });
+        sendToClient({ type: "pty-write", text, raw: false });
         activity.busy = false;
         activity.update("idle", client);
         await cmd.reply({ content: "📦 Compacting context...", ephemeral: true });
@@ -157,24 +169,142 @@ export async function setupSlashCommands(
       }
       case "model": {
         const model = cmd.options.getString("model", true);
-        sendToParent({ type: "pty-write", text: `/model ${model}`, raw: false });
+        sendToClient({ type: "pty-write", text: `/model ${model}`, raw: false });
         await cmd.reply({ content: `🤖 Switching to \`${model}\`...`, ephemeral: true });
         break;
       }
       case "stop":
-        sendToParent({ type: "pty-write", text: "\x1b", raw: true });
-        setTimeout(() => sendToParent({ type: "pty-write", text: "\x03", raw: true }), 200);
+        sendToClient({ type: "pty-write", text: "\x1b", raw: true });
+        setTimeout(() => sendToClient({ type: "pty-write", text: "\x03", raw: true }), 200);
         activity.busy = false;
         activity.stopOverrideUntil = Date.now() + 3000;
         activity.update("idle", client);
         await cmd.reply({ content: "⏹️ Interrupted", ephemeral: true });
         setTimeout(() => activity.tryDequeue(), 3500);
         break;
+      case "key": {
+        const input = cmd.options.getString("keys", true);
+        const { keys, display } = parseKeyInput(input);
+        const KEY_SEND_DELAY = 100;
+        keys.forEach((key, i) => {
+          setTimeout(() => sendToClient({ type: "pty-write", text: key, raw: true }), i * KEY_SEND_DELAY);
+        });
+        await cmd.reply({ content: `⌨️ Sent: ${display}`, ephemeral: true });
+        break;
+      }
       case "queue":
         await handleQueueCommand(cmd, deps);
         break;
     }
-  });
+  };
+
+  client.on(Events.InteractionCreate, handler);
+  return () => client.removeListener(Events.InteractionCreate, handler);
+}
+
+// ── Key parsing for /key command ──
+
+const KEY_MAP: Record<string, string> = {
+  // Navigation
+  enter: "\r",
+  return: "\r",
+  space: " ",
+  tab: "\t",
+  "shift+tab": "\x1b[Z",
+  escape: "\x1b",
+  esc: "\x1b",
+  backspace: "\x7f",
+  delete: "\x1b[3~",
+  up: "\x1b[A",
+  down: "\x1b[B",
+  right: "\x1b[C",
+  left: "\x1b[D",
+  home: "\x1b[H",
+  end: "\x1b[F",
+  pageup: "\x1b[5~",
+  pagedown: "\x1b[6~",
+  insert: "\x1b[2~",
+  // Ctrl combinations
+  "ctrl+a": "\x01",
+  "ctrl+b": "\x02",
+  "ctrl+c": "\x03",
+  "ctrl+d": "\x04",
+  "ctrl+e": "\x05",
+  "ctrl+f": "\x06",
+  "ctrl+g": "\x07",
+  "ctrl+h": "\x08",
+  "ctrl+k": "\x0b",
+  "ctrl+l": "\x0c",
+  "ctrl+n": "\x0e",
+  "ctrl+o": "\x0f",
+  "ctrl+p": "\x10",
+  "ctrl+r": "\x12",
+  "ctrl+t": "\x14",
+  "ctrl+u": "\x15",
+  "ctrl+w": "\x17",
+  "ctrl+z": "\x1a",
+  // Function keys
+  f1: "\x1bOP",
+  f2: "\x1bOQ",
+  f3: "\x1bOR",
+  f4: "\x1bOS",
+  f5: "\x1b[15~",
+  f6: "\x1b[17~",
+  f7: "\x1b[18~",
+  f8: "\x1b[19~",
+  f9: "\x1b[20~",
+  f10: "\x1b[21~",
+  f11: "\x1b[23~",
+  f12: "\x1b[24~",
+};
+
+const KEY_LABELS: Record<string, string> = {
+  enter: "Enter", return: "Enter", space: "Space", tab: "Tab",
+  "shift+tab": "Shift+Tab", escape: "Esc", esc: "Esc",
+  backspace: "Backspace", delete: "Del", insert: "Ins",
+  up: "↑", down: "↓", right: "→", left: "←",
+  home: "Home", end: "End", pageup: "PgUp", pagedown: "PgDn",
+  "ctrl+a": "Ctrl+A", "ctrl+b": "Ctrl+B", "ctrl+c": "Ctrl+C",
+  "ctrl+d": "Ctrl+D", "ctrl+e": "Ctrl+E", "ctrl+f": "Ctrl+F",
+  "ctrl+g": "Ctrl+G", "ctrl+h": "Ctrl+H", "ctrl+k": "Ctrl+K",
+  "ctrl+l": "Ctrl+L", "ctrl+n": "Ctrl+N", "ctrl+o": "Ctrl+O",
+  "ctrl+p": "Ctrl+P", "ctrl+r": "Ctrl+R", "ctrl+t": "Ctrl+T",
+  "ctrl+u": "Ctrl+U", "ctrl+w": "Ctrl+W", "ctrl+z": "Ctrl+Z",
+  f1: "F1", f2: "F2", f3: "F3", f4: "F4", f5: "F5", f6: "F6",
+  f7: "F7", f8: "F8", f9: "F9", f10: "F10", f11: "F11", f12: "F12",
+};
+
+function parseKeyInput(input: string): { keys: string[]; display: string } {
+  const tokens = input.trim().split(/\s+/);
+  const keys: string[] = [];
+  const labels: string[] = [];
+
+  for (const token of tokens) {
+    const lower = token.toLowerCase();
+    // Check for repeat syntax: "enter*3" → enter enter enter
+    const repeatMatch = lower.match(/^(.+)\*(\d+)$/);
+    if (repeatMatch) {
+      const [, name, countStr] = repeatMatch;
+      const count = Math.min(parseInt(countStr, 10), 20);
+      const seq = KEY_MAP[name];
+      if (seq) {
+        for (let i = 0; i < count; i++) keys.push(seq);
+        labels.push(`${KEY_LABELS[name] || name} x${count}`);
+        continue;
+      }
+    }
+
+    if (KEY_MAP[lower]) {
+      keys.push(KEY_MAP[lower]);
+      labels.push(KEY_LABELS[lower] || lower);
+    } else {
+      // Literal text — send each character
+      for (const ch of token) keys.push(ch);
+      labels.push(`"${token}"`);
+    }
+  }
+
+  return { keys, display: labels.join(" ") };
 }
 
 async function handleQueueCommand(cmd: ChatInputCommandInteraction, deps: SlashCommandDeps) {
