@@ -13,8 +13,11 @@ When enabled, each Claude session gets its own Discord channel. Messages, tool c
 - Tool calls show up with Allow / Deny buttons
 - File edits render as syntax-highlighted diffs
 - Long outputs go into threads so the channel stays readable
+- Read/Grep/Glob calls get batched into a single grouped thread
+- MCP tool calls are grouped by server with a live "Querying..." indicator
 - Tasks get a pinned board with a progress bar
 - If Claude is busy, your messages queue up and execute in order
+- Send raw keypresses with `/key` when prompts get stuck
 
 ## Setup
 
@@ -74,8 +77,11 @@ Once connected, you get slash commands in the channel:
 | `/mode <mode>` | Switch permission mode |
 | `/status` | Session info and current state |
 | `/stop` | Interrupt Claude |
+| `/restart` | Restart Claude CLI (same args, fresh process) |
 | `/clear` | Clear context, start fresh |
 | `/compact [instructions]` | Trigger context compaction |
+| `/model <model>` | Switch Claude model (sonnet/opus/haiku) |
+| `/key <keys>` | Send raw keypresses (e.g. `enter`, `up down enter`, `ctrl+c`) |
 | `/queue view\|clear\|remove\|edit` | Manage queued messages |
 
 You can also just type in the channel to send messages to Claude, or attach images.
