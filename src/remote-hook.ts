@@ -1,6 +1,9 @@
 /**
  * UserPromptSubmit hook script.
- * Intercepts /discord on|off commands before Claude sees them.
+ * Intercepts /remote commands before Claude sees them — zero API cost.
+ *
+ * Outputs {"decision":"block","reason":"..."} to stdout to prevent the prompt
+ * from reaching the API while showing the reason to the user.
  */
 
 import { findPipe, sendPipeMessage } from "./pipe-client.js";
@@ -11,31 +14,41 @@ interface HookInput {
   prompt: string;
 }
 
+function block(reason: string): never {
+  process.stdout.write(JSON.stringify({ decision: "block", reason }));
+  process.exit(0);
+}
+
 async function main() {
   const chunks: Buffer[] = [];
   for await (const chunk of process.stdin) {
     chunks.push(chunk as Buffer);
   }
   const input = JSON.parse(Buffer.concat(chunks).toString()) as HookInput;
-  const prompt = input.prompt.trim().toLowerCase();
+  const prompt = input.prompt.trim();
+  const promptLower = prompt.toLowerCase();
 
-  if (!prompt.startsWith("/discord")) {
+  if (!promptLower.startsWith("/remote")) {
+    // Not our command — pass through
     process.exit(0);
   }
 
+  const args = prompt.slice("/remote".length).trim();
+  const argsLower = args.toLowerCase();
+
   const pipe = process.env.CLAUDE_REMOTE_PIPE || findPipe();
   if (!pipe) {
-    process.stderr.write("[claude-remote] No active instance found. Start Claude with `claude-remote` instead of `claude`.\n");
-    process.exit(2);
+    block("No active claude-remote instance. Start Claude with `claude-remote` instead of `claude`.");
   }
-
-  const args = input.prompt.trim().slice("/discord".length).trim();
-  const argsLower = args.toLowerCase();
 
   if (argsLower === "off") {
     await sendPipeMessage(pipe, { type: "disable" });
-    process.stderr.write("Discord sync disabled\n");
-    process.exit(2);
+    block("Discord sync disabled");
+  }
+
+  if (argsLower === "status") {
+    const resp = await sendPipeMessage(pipe, { type: "status" });
+    block(`Discord sync: ${resp?.active ? "ON" : "OFF"}`);
   }
 
   let action: "enable" | "disable";
@@ -54,15 +67,11 @@ async function main() {
 
   if (action === "enable") {
     await sendPipeMessage(pipe, { type: "enable", sessionId: input.session_id, channelName });
-    process.stderr.write(`Discord sync enabled${channelName ? ` (${channelName})` : ""}\n`);
+    block(`Discord sync enabled${channelName ? ` (${channelName})` : ""}`);
   } else {
     await sendPipeMessage(pipe, { type: "disable" });
-    process.stderr.write("Discord sync disabled\n");
+    block("Discord sync disabled");
   }
-  process.exit(2);
 }
 
-main().catch((err) => {
-  process.stderr.write(`[claude-remote] Hook error: ${err}\n`);
-  process.exit(0);
-});
+main().catch((err) => block(`[claude-remote] Hook error: ${err}`));

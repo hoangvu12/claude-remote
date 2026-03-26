@@ -68,7 +68,7 @@ function getStatuslineCommand(): string {
 // ── Skill & statusline management ──
 
 const HOOK_EVENT_TYPES = ["UserPromptSubmit", "SessionStart", "Stop", "PostCompact"];
-const HOOK_SCRIPT_NAMES = ["discord-hook", "session-hook", "state-hook"];
+const HOOK_SCRIPT_NAMES = ["remote-hook", "discord-hook", "session-hook", "state-hook"];
 
 function isOurHook(h: Record<string, string>): boolean {
   return HOOK_SCRIPT_NAMES.some((name) => h.command?.includes(name));
@@ -97,25 +97,22 @@ function installHooksAndStatusline() {
   const oldSkillDir = path.join(os.homedir(), ".claude", "skills", "discord");
   fs.rmSync(oldSkillDir, { recursive: true, force: true });
 
-  // Install /remote skill (uses Haiku for speed)
+  // Recreate /remote skill dir — removes old Haiku-based skill if present.
+  // The stub only exists for fuzzy-finder discoverability; actual work is done
+  // by the UserPromptSubmit hook (zero API cost).
   const skillDir = getSkillDir();
+  fs.rmSync(skillDir, { recursive: true, force: true });
   fs.mkdirSync(skillDir, { recursive: true });
 
   const skillContent = `---
 name: remote
-description: Toggle remote control sync for this session
-model: haiku
+description: Toggle remote control sync for this session (on/off/status)
+argument-hint: "[on|off|status]"
 disable-model-invocation: true
-allowed-tools: Bash
 ---
 
-Run the remote-cmd CLI to toggle/control remote sync. Pass through any arguments the user provided.
-
-\`\`\`bash
-remote-cmd $ARGUMENTS
-\`\`\`
-
-Print the output to the user. Do not add any extra commentary.
+This command is handled by a UserPromptSubmit hook.
+If you see this text, the hook did not intercept the prompt — run \`claude-remote setup\` to reinstall hooks.
 `;
 
   fs.writeFileSync(path.join(skillDir, "SKILL.md"), skillContent);
@@ -140,26 +137,18 @@ Print the output to the user. Do not add any extra commentary.
   // Clean old claude-remote hooks from all event types
   cleanRemoteHooks(hooks);
 
-  // Add SessionStart hook — registers session info with rc.ts
-  if (!hooks.SessionStart) hooks.SessionStart = [];
-  hooks.SessionStart.push({
-    matcher: "",
-    hooks: [{ type: "command", command: getHookCommand("session-hook"), timeout: 5000 }],
-  });
+  const addHook = (event: string, script: string) => {
+    if (!hooks[event]) hooks[event] = [];
+    hooks[event].push({
+      matcher: "",
+      hooks: [{ type: "command", command: getHookCommand(script), timeout: 5000 }],
+    });
+  };
 
-  // Add Stop hook — authoritative idle signal when Claude finishes responding
-  if (!hooks.Stop) hooks.Stop = [];
-  hooks.Stop.push({
-    matcher: "",
-    hooks: [{ type: "command", command: getHookCommand("state-hook"), timeout: 5000 }],
-  });
-
-  // Add PostCompact hook — idle signal after manual /compact
-  if (!hooks.PostCompact) hooks.PostCompact = [];
-  hooks.PostCompact.push({
-    matcher: "",
-    hooks: [{ type: "command", command: getHookCommand("state-hook"), timeout: 5000 }],
-  });
+  addHook("UserPromptSubmit", "remote-hook");
+  addHook("SessionStart", "session-hook");
+  addHook("Stop", "state-hook");
+  addHook("PostCompact", "state-hook");
 
   settings.hooks = hooks;
 

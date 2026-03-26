@@ -7,6 +7,7 @@ import os from "node:os";
 export const CONFIG_DIR = path.join(os.homedir(), ".claude-remote");
 export const STATUS_FLAG = path.join(CONFIG_DIR, "active");
 export const PIPE_REGISTRY = path.join(CONFIG_DIR, "pipes");
+export const DAEMON_PIPE_NAME = "\\\\.\\pipe\\claude-remote-daemon";
 
 // ── Discord custom ID prefixes ──
 
@@ -127,12 +128,29 @@ export function capSet<T>(set: Set<T>, maxSize: number): void {
 }
 
 /**
- * Safely unlink a file, ignoring ENOENT.
+ * Create a JSONL line parser for a socket/stream.
+ * Buffers incoming data and calls `onLine` for each complete newline-delimited JSON line.
+ */
+export function createLineParser(onLine: (line: string) => void): (data: Buffer | string) => void {
+  let buffer = "";
+  return (data) => {
+    buffer += data.toString();
+    const lines = buffer.split("\n");
+    buffer = lines.pop()!;
+    for (const line of lines) {
+      if (line.trim()) onLine(line);
+    }
+  };
+}
+
+/**
+ * Safely unlink a file, ignoring ENOENT and EPERM (Windows file locks).
  */
 export function safeUnlink(filePath: string): void {
   try {
     fs.unlinkSync(filePath);
   } catch (err: unknown) {
-    if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code !== "ENOENT" && code !== "EPERM") throw err;
   }
 }

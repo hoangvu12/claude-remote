@@ -44,13 +44,17 @@ export class DiscordProvider implements OutputProvider, ThreadCapable, InputCapa
   private threadCache = new Map<string, ThreadChannel>();
   private userMessageCb?: (text: string, attachments?: UserAttachment[]) => void;
   private interactionCb?: (interaction: ProviderInteraction) => void;
+  private boundHandleMessage: (msg: Message) => void;
+  private boundHandleInteraction: (interaction: import("discord.js").Interaction) => void;
 
   constructor(
     private client: Client,
     private channel: TextChannel,
   ) {
-    client.on(Events.MessageCreate, (msg) => this.handleMessage(msg));
-    client.on(Events.InteractionCreate, (interaction) => this.handleInteraction(interaction));
+    this.boundHandleMessage = (msg) => this.handleMessage(msg);
+    this.boundHandleInteraction = (i) => this.handleInteraction(i);
+    client.on(Events.MessageCreate, this.boundHandleMessage);
+    client.on(Events.InteractionCreate, this.boundHandleInteraction);
   }
 
   // ── OutputProvider ──
@@ -85,9 +89,11 @@ export class DiscordProvider implements OutputProvider, ThreadCapable, InputCapa
   }
 
   async destroy(): Promise<void> {
+    this.client.removeListener(Events.MessageCreate, this.boundHandleMessage);
+    this.client.removeListener(Events.InteractionCreate, this.boundHandleInteraction);
     this.messageCache.clear();
     this.threadCache.clear();
-    this.client.destroy();
+    // Do NOT call client.destroy() — client is shared across sessions
   }
 
   // ── ThreadCapable ──
@@ -172,6 +178,7 @@ export class DiscordProvider implements OutputProvider, ThreadCapable, InputCapa
 
   private async handleInteraction(interaction: import("discord.js").Interaction) {
     if (!interaction.isMessageComponent() && !interaction.isModalSubmit()) return;
+    if (interaction.channelId !== this.channel.id) return;
 
     if (interaction.isButton()) {
       const id = interaction.customId;

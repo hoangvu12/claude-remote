@@ -1,7 +1,7 @@
 import { ActivityType, type Client } from "discord.js";
 import type { DiscordProvider } from "./providers/discord.js";
 import type { SessionContext } from "./handler.js";
-import type { DaemonToParent } from "./types.js";
+import type { PtyWriteMessage } from "./types.js";
 import { COLOR } from "./discord-renderer.js";
 
 export type ActivityState = "idle" | "thinking" | "working";
@@ -41,7 +41,7 @@ export class ActivityManager {
 
   constructor(
     private provider: DiscordProvider,
-    private sendToParent: (msg: DaemonToParent) => void,
+    private sendToClient: (msg: Omit<PtyWriteMessage, "sessionKey">) => void,
   ) {}
 
   /** Register a callback that fires whenever activity transitions to idle */
@@ -105,9 +105,9 @@ export class ActivityManager {
     this.busy = true;
     this.resetIdleTimer();
     this.ctx.originMessages.add(next.text.trim());
-    this.sendToParent({ type: "pty-write", text: next.text });
+    this.sendToClient({ type: "pty-write", text: next.text });
     if (next.text.includes("\n")) {
-      setTimeout(() => this.sendToParent({ type: "pty-write", text: "\r", raw: true }), 200);
+      setTimeout(() => this.sendToClient({ type: "pty-write", text: "\r", raw: true }), 200);
     }
     this.update("thinking");
     this.provider.send({
