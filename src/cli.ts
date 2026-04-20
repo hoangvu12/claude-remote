@@ -7,7 +7,7 @@ import path from "node:path";
 import os from "node:os";
 import { execSync } from "node:child_process";
 import { createRequire } from "node:module";
-import { CONFIG_DIR } from "./utils.js";
+import { CONFIG_DIR, getClaudeDir } from "./utils.js";
 import type { Config } from "./types.js";
 
 const CONFIG_FILE = path.join(CONFIG_DIR, "config.json");
@@ -53,11 +53,11 @@ function saveConfig(config: Config) {
 }
 
 function getClaudeSettingsPath(): string {
-  return path.join(os.homedir(), ".claude", "settings.json");
+  return path.join(getClaudeDir(), "settings.json");
 }
 
 function getSkillDir(): string {
-  return path.join(os.homedir(), ".claude", "skills", "remote");
+  return path.join(getClaudeDir(), "skills", "remote");
 }
 
 function getStatuslineCommand(): string {
@@ -94,7 +94,7 @@ function getHookCommand(scriptName: string): string {
 
 function installHooksAndStatusline() {
   // Remove old /discord skill if it exists (migration from discord-rc)
-  const oldSkillDir = path.join(os.homedir(), ".claude", "skills", "discord");
+  const oldSkillDir = path.join(getClaudeDir(), "skills", "discord");
   fs.rmSync(oldSkillDir, { recursive: true, force: true });
 
   // Recreate /remote skill dir — removes old Haiku-based skill if present.
@@ -161,7 +161,7 @@ function uninstallHooksAndStatusline() {
   const skillDir = getSkillDir();
   fs.rmSync(skillDir, { recursive: true, force: true });
   // Remove old /discord skill if it exists (migration from discord-rc)
-  const oldSkillDir = path.join(os.homedir(), ".claude", "skills", "discord");
+  const oldSkillDir = path.join(getClaudeDir(), "skills", "discord");
   fs.rmSync(oldSkillDir, { recursive: true, force: true });
 
   // Remove hooks + statusline from settings

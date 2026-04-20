@@ -9,6 +9,31 @@ export const STATUS_FLAG = path.join(CONFIG_DIR, "active");
 export const PIPE_REGISTRY = path.join(CONFIG_DIR, "pipes");
 export const DAEMON_PIPE_NAME = "\\\\.\\pipe\\claude-remote-daemon";
 
+/**
+ * Resolve the active Claude config directory.
+ *
+ * Precedence:
+ *   1. CLAUDE_CONFIG_DIR env var (official Anthropic override)
+ *   2. ~/.claude-switch/active-path (claude-switch v4 pointer — lets daemons
+ *      follow profile switches live without a restart)
+ *   3. ~/.claude (default)
+ *
+ * Called on-demand, not cached, so the daemon picks up profile switches
+ * between requests.
+ */
+export function getClaudeDir(): string {
+  const envDir = process.env.CLAUDE_CONFIG_DIR;
+  if (envDir && fs.existsSync(envDir)) return envDir;
+
+  try {
+    const pointer = path.join(os.homedir(), ".claude-switch", "active-path");
+    const dir = fs.readFileSync(pointer, "utf-8").trim();
+    if (dir && fs.existsSync(dir)) return dir;
+  } catch {}
+
+  return path.join(os.homedir(), ".claude");
+}
+
 // ── Discord custom ID prefixes ──
 
 export const ID_PREFIX = {
@@ -42,7 +67,7 @@ export function truncate(text: string, maxLen: number, suffix = "…"): string {
 }
 
 export function resolveJSONLPath(sessionId: string, cwd: string): string {
-  const claudeDir = path.join(os.homedir(), ".claude", "projects");
+  const claudeDir = path.join(getClaudeDir(), "projects");
   const encoded = encodeProjectPath(cwd);
   return path.join(claudeDir, encoded, `${sessionId}.jsonl`);
 }
