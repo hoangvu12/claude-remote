@@ -119,8 +119,15 @@ export function isLocalCommand(text: string): boolean {
 }
 
 // ── Permission mode cycling (matches Claude Code's Shift+Tab order) ──
+//
+// Claude Code computes the Shift+Tab next-mode dynamically (see upstream
+// getNextPermissionMode.ts). `bypassPermissions` only appears in the cycle
+// when `isBypassPermissionsModeAvailable` — i.e. the user launched with
+// `--dangerously-skip-permissions` AND settings don't disable it. For regular
+// users the cycle is 3-way (default → acceptEdits → plan → default).
 
-const MODE_CYCLE = ["default", "acceptEdits", "plan", "bypassPermissions"] as const;
+const MODE_CYCLE_WITH_BYPASS = ["default", "acceptEdits", "plan", "bypassPermissions"] as const;
+const MODE_CYCLE_NO_BYPASS = ["default", "acceptEdits", "plan"] as const;
 
 export const MODE_LABELS: Record<string, string> = {
   default: "Default",
@@ -129,16 +136,28 @@ export const MODE_LABELS: Record<string, string> = {
   bypassPermissions: "Bypass Permissions",
 };
 
+export type CycleMode = typeof MODE_CYCLE_WITH_BYPASS[number];
+
+/** Return the cycle order for a session based on whether bypass is reachable. */
+export function getModeCycle(bypassAvailable: boolean): readonly CycleMode[] {
+  return bypassAvailable ? MODE_CYCLE_WITH_BYPASS : MODE_CYCLE_NO_BYPASS;
+}
+
 /**
- * Calculate the number of Shift+Tab presses to go from `current` to `target`.
- * Returns 0 if already at target or modes are unknown.
+ * Calculate the number of Shift+Tab presses to go from `current` to `target`
+ * given the available cycle. Returns 0 if already at target or either mode is
+ * not in the cycle (callers should check `isModeReachable` first).
  */
-export function modeShiftTabCount(current: string | null, target: string): number {
-  const from = MODE_CYCLE.indexOf((current || "default") as typeof MODE_CYCLE[number]);
-  const to = MODE_CYCLE.indexOf(target as typeof MODE_CYCLE[number]);
+export function modeShiftTabCount(current: string | null, target: string, cycle: readonly CycleMode[]): number {
+  const from = cycle.indexOf((current || "default") as CycleMode);
+  const to = cycle.indexOf(target as CycleMode);
   if (from === -1 || to === -1 || from === to) return 0;
-  // Cycle forward: (to - from + len) % len
-  return (to - from + MODE_CYCLE.length) % MODE_CYCLE.length;
+  return (to - from + cycle.length) % cycle.length;
+}
+
+/** True if `target` appears in the provided cycle. */
+export function isModeReachable(target: string, cycle: readonly CycleMode[]): boolean {
+  return cycle.includes(target as CycleMode);
 }
 
 /**

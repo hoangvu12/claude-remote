@@ -1,3 +1,4 @@
+import fs from "node:fs";
 import type { MessageHandler, SessionContext, HandlerResult } from "../handler.js";
 import type { ProcessedMessage } from "../types.js";
 import type { ProviderMessage } from "../provider.js";
@@ -5,6 +6,25 @@ import { ID_PREFIX, truncate } from "../utils.js";
 import { COLOR, MAX_EMBED_DESC } from "../discord-renderer.js";
 import { PLAN_TOOLS } from "../tools.js";
 const COLOR_AMBER = 0xf5a623;
+
+/**
+ * Read plan text. V2 ExitPlanMode stores the plan on disk under `planFilePath`;
+ * `normalizeToolInput` usually injects `plan` into the tool_use but if we catch
+ * a raw pre-normalized write, fall back to reading the file.
+ */
+function readPlanFromInput(input: Record<string, unknown> | undefined): string {
+  if (!input) return "";
+  if (typeof input.plan === "string" && input.plan.trim()) return input.plan;
+  const planFilePath = typeof input.planFilePath === "string" ? input.planFilePath : "";
+  if (planFilePath) {
+    try {
+      return fs.readFileSync(planFilePath, "utf-8");
+    } catch {
+      return "";
+    }
+  }
+  return "";
+}
 
 export class PlanModeHandler implements MessageHandler {
   name = "plan-mode";
@@ -30,8 +50,8 @@ export class PlanModeHandler implements MessageHandler {
         this.planMessage = null;
       }
 
-      // Show the plan text if present
-      const planText = typeof pm.toolInput?.plan === "string" ? pm.toolInput.plan : "";
+      // Show the plan text if present (V2 may store the plan on disk).
+      const planText = readPlanFromInput(pm.toolInput);
       if (planText) {
         await ctx.provider.send({
           embed: {

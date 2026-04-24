@@ -12,7 +12,7 @@ import type { DiscordProvider } from "./providers/discord.js";
 import type { SessionContext } from "./handler.js";
 import type { PtyWriteMessage } from "./types.js";
 import { ActivityManager, STATUS_LABELS, type ActivityState } from "./activity.js";
-import { modeShiftTabCount, MODE_LABELS, ID_PREFIX } from "./utils.js";
+import { modeShiftTabCount, getModeCycle, isModeReachable, MODE_LABELS, ID_PREFIX } from "./utils.js";
 import { COLOR } from "./discord-renderer.js";
 
 export interface SlashCommandDeps {
@@ -71,8 +71,12 @@ export async function setupSlashCommands(
           .setRequired(true)
           .addChoices(
             { name: "Sonnet", value: "sonnet" },
+            { name: "Sonnet 1M", value: "sonnet[1m]" },
             { name: "Opus", value: "opus" },
+            { name: "Opus 1M", value: "opus[1m]" },
+            { name: "Opus Plan (opus for plan, sonnet for execution)", value: "opusplan" },
             { name: "Haiku", value: "haiku" },
+            { name: "Best (auto-select)", value: "best" },
           )
       ),
     new SlashCommandBuilder()
@@ -102,6 +106,61 @@ export async function setupSlashCommands(
         sub.setName("edit").setDescription("Edit a queued message")
           .addIntegerOption((opt) => opt.setName("id").setDescription("Queue ID to edit").setRequired(true))
       ),
+    new SlashCommandBuilder()
+      .setName("cost")
+      .setDescription("Show cost and duration for this session"),
+    new SlashCommandBuilder()
+      .setName("rewind")
+      .setDescription("Rewind the conversation (like Ctrl+G in the TTY)"),
+    new SlashCommandBuilder()
+      .setName("resume")
+      .setDescription("Resume a previous session by id (restarts Claude with --resume)")
+      .addStringOption((opt) =>
+        opt.setName("id")
+          .setDescription("Session id or search term (blank = pick from list in TTY)")
+          .setRequired(false)
+      ),
+    new SlashCommandBuilder()
+      .setName("plan")
+      .setDescription("Enter plan mode with an optional prompt")
+      .addStringOption((opt) =>
+        opt.setName("prompt")
+          .setDescription("What to plan (optional)")
+          .setRequired(false)
+      ),
+    new SlashCommandBuilder()
+      .setName("memory")
+      .setDescription("Append text to project CLAUDE.md")
+      .addStringOption((opt) =>
+        opt.setName("text")
+          .setDescription("Text to append (as a memory note)")
+          .setRequired(true)
+      ),
+    new SlashCommandBuilder()
+      .setName("export")
+      .setDescription("Export the current conversation")
+      .addStringOption((opt) =>
+        opt.setName("filename")
+          .setDescription("Optional output filename")
+          .setRequired(false)
+      ),
+    new SlashCommandBuilder()
+      .setName("mcp")
+      .setDescription("Toggle or list MCP servers")
+      .addStringOption((opt) =>
+        opt.setName("args")
+          .setDescription("e.g. 'enable slack' or 'disable slack'. Empty = list.")
+          .setRequired(false)
+      ),
+    new SlashCommandBuilder()
+      .setName("doctor")
+      .setDescription("Run Claude Code diagnostics"),
+    new SlashCommandBuilder()
+      .setName("hooks")
+      .setDescription("Show installed hook configuration"),
+    new SlashCommandBuilder()
+      .setName("kill-agents")
+      .setDescription("Kill all running background subagents"),
   ];
 
   if (!skipRegistration) {
@@ -123,20 +182,32 @@ export async function setupSlashCommands(
     switch (cmd.commandName) {
       case "mode": {
         const target = cmd.options.getString("mode", true);
-        const current = getCtx()?.permissionMode || "default";
+        const ctx = getCtx();
+        const current = ctx?.permissionMode || "default";
+        // bypassPermissions is only reachable when the user launched Claude
+        // with `--dangerously-skip-permissions` (upstream permissionSetup.ts).
+        // We approximate via ctx.bypassAvailable, set at session-register.
+        const bypassAvailable = ctx?.bypassAvailable ?? (current === "bypassPermissions");
+        const cycle = getModeCycle(bypassAvailable);
         if (target === current) {
           await cmd.reply({ content: `Already in **${MODE_LABELS[target]}**`, ephemeral: true });
           return;
         }
-        const presses = modeShiftTabCount(current, target);
+        if (!isModeReachable(target, cycle)) {
+          await cmd.reply({
+            content: `⚠️ **${MODE_LABELS[target] || target}** isn't reachable in this session. Relaunch Claude with \`--dangerously-skip-permissions\` to enable bypass mode.`,
+            ephemeral: true,
+          });
+          return;
+        }
+        const presses = modeShiftTabCount(current, target, cycle);
         const SHIFT_TAB = "\x1b[Z";
-        // Send each Shift+Tab with a delay so Claude Code has time to process each one
         for (let i = 0; i < presses; i++) {
           if (i > 0) await new Promise((r) => setTimeout(r, 500));
           sendToClient({ type: "pty-write", text: SHIFT_TAB, raw: true });
         }
-        // Optimistically update tracked mode — JSONL won't reflect the change until next user message
-        const ctx = getCtx();
+        // Optimistically update tracked mode — JSONL won't reflect the change
+        // until the next user message attaches a permissionMode field.
         if (ctx) ctx.permissionMode = target;
         await cmd.reply({ content: `🔄 Switching to **${MODE_LABELS[target]}** (${presses} cycle${presses > 1 ? "s" : ""})`, ephemeral: true });
         break;
@@ -178,8 +249,11 @@ export async function setupSlashCommands(
         break;
       }
       case "stop":
+        // Escape alone is the upstream `chat:cancel` action — cancels tools,
+        // thinking, and input. Sending Ctrl+C after it used to set the
+        // "Press Ctrl-C again to exit" pending state on an idle prompt,
+        // which could confusingly double-trigger exit on a follow-up Ctrl+C.
         sendToClient({ type: "pty-write", text: "\x1b", raw: true });
-        setTimeout(() => sendToClient({ type: "pty-write", text: "\x03", raw: true }), 200);
         activity.busy = false;
         activity.stopOverrideUntil = Date.now() + 3000;
         activity.update("idle", client);
@@ -204,6 +278,68 @@ export async function setupSlashCommands(
       }
       case "queue":
         await handleQueueCommand(cmd, deps);
+        break;
+      case "cost":
+        sendToClient({ type: "pty-write", text: "/cost", raw: false });
+        await cmd.reply({ content: "💰 Requesting cost report...", ephemeral: true });
+        break;
+      case "rewind":
+        // Upstream binding is Ctrl+G — send it directly so this works even
+        // if the user has `/rewind` the slash-command disabled.
+        sendToClient({ type: "pty-write", text: "\x07", raw: true });
+        await cmd.reply({ content: "⏪ Rewinding...", ephemeral: true });
+        break;
+      case "resume": {
+        const id = cmd.options.getString("id") || "";
+        const payload = id.trim() ? `/resume ${id.trim()}` : "/resume";
+        sendToClient({ type: "pty-write", text: payload, raw: false });
+        await cmd.reply({ content: id ? `↩️ Resuming \`${id}\`...` : "↩️ Showing resume picker...", ephemeral: true });
+        break;
+      }
+      case "plan": {
+        const prompt = cmd.options.getString("prompt") || "";
+        const payload = prompt.trim() ? `/plan ${prompt.trim()}` : "/plan";
+        sendToClient({ type: "pty-write", text: payload, raw: false });
+        activity.busy = true;
+        activity.update("thinking", client);
+        await cmd.reply({ content: "📐 Entering plan mode...", ephemeral: true });
+        break;
+      }
+      case "memory": {
+        const text = cmd.options.getString("text", true);
+        // Use # prefix — the standard "quick memory" shortcut in Claude Code
+        // that appends to CLAUDE.md without going through the memory editor UI.
+        sendToClient({ type: "pty-write", text: `# ${text}`, raw: false });
+        await cmd.reply({ content: "🧠 Saved to CLAUDE.md", ephemeral: true });
+        break;
+      }
+      case "export": {
+        const filename = cmd.options.getString("filename") || "";
+        const payload = filename.trim() ? `/export ${filename.trim()}` : "/export";
+        sendToClient({ type: "pty-write", text: payload, raw: false });
+        await cmd.reply({ content: "📤 Exporting conversation...", ephemeral: true });
+        break;
+      }
+      case "mcp": {
+        const args = cmd.options.getString("args") || "";
+        const payload = args.trim() ? `/mcp ${args.trim()}` : "/mcp";
+        sendToClient({ type: "pty-write", text: payload, raw: false });
+        await cmd.reply({ content: "🔌 MCP command sent", ephemeral: true });
+        break;
+      }
+      case "doctor":
+        sendToClient({ type: "pty-write", text: "/doctor", raw: false });
+        await cmd.reply({ content: "🩺 Running diagnostics...", ephemeral: true });
+        break;
+      case "hooks":
+        sendToClient({ type: "pty-write", text: "/hooks", raw: false });
+        await cmd.reply({ content: "🪝 Showing hooks config...", ephemeral: true });
+        break;
+      case "kill-agents":
+        // Upstream `chat:killAgents` is Ctrl+X Ctrl+K — spaced so Ink sees the chord.
+        sendToClient({ type: "pty-write", text: "\x18", raw: true });
+        setTimeout(() => sendToClient({ type: "pty-write", text: "\x0b", raw: true }), 100);
+        await cmd.reply({ content: "🗡️ Kill-agents chord sent", ephemeral: true });
         break;
     }
   };
@@ -242,7 +378,7 @@ const KEY_MAP: Record<string, string> = {
   "ctrl+e": "\x05",
   "ctrl+f": "\x06",
   "ctrl+g": "\x07",
-  "ctrl+h": "\x08",
+  "ctrl+h": "\x7f",
   "ctrl+k": "\x0b",
   "ctrl+l": "\x0c",
   "ctrl+n": "\x0e",
@@ -252,7 +388,9 @@ const KEY_MAP: Record<string, string> = {
   "ctrl+t": "\x14",
   "ctrl+u": "\x15",
   "ctrl+w": "\x17",
-  "ctrl+z": "\x1a",
+  // ctrl+z deliberately omitted — SIGTSTP suspends the Claude child on POSIX
+  // terminals (WSL/macOS) and leaves the bridge appearing hung. Users who
+  // really need it can still send the raw byte via literal text.
   // Function keys
   f1: "\x1bOP",
   f2: "\x1bOQ",
@@ -279,7 +417,7 @@ const KEY_LABELS: Record<string, string> = {
   "ctrl+g": "Ctrl+G", "ctrl+h": "Ctrl+H", "ctrl+k": "Ctrl+K",
   "ctrl+l": "Ctrl+L", "ctrl+n": "Ctrl+N", "ctrl+o": "Ctrl+O",
   "ctrl+p": "Ctrl+P", "ctrl+r": "Ctrl+R", "ctrl+t": "Ctrl+T",
-  "ctrl+u": "Ctrl+U", "ctrl+w": "Ctrl+W", "ctrl+z": "Ctrl+Z",
+  "ctrl+u": "Ctrl+U", "ctrl+w": "Ctrl+W",
   f1: "F1", f2: "F2", f3: "F3", f4: "F4", f5: "F5", f6: "F6",
   f7: "F7", f8: "F8", f9: "F9", f10: "F10", f11: "F11", f12: "F12",
 };

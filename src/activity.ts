@@ -12,7 +12,14 @@ export interface QueuedMessage {
   addedAt: number;
 }
 
-const IDLE_TIMEOUT = 120_000;
+/**
+ * Fallback idle timer — normally the Stop hook (state-hook.ts) fires
+ * deterministically at turn end and calls transitionToIdle. This timer only
+ * matters when the hook doesn't fire (plain `claude` without claude-remote
+ * hooks installed, or hook failure). Generous to avoid false-positive idle
+ * transitions during long tool runs.
+ */
+const IDLE_TIMEOUT = 10 * 60_000;
 
 const PRESENCE_LABELS: Record<ActivityState, string> = {
   idle: "Waiting for input",
@@ -106,9 +113,6 @@ export class ActivityManager {
     this.resetIdleTimer();
     this.ctx.originMessages.add(next.text.trim());
     this.sendToClient({ type: "pty-write", text: next.text });
-    if (next.text.includes("\n")) {
-      setTimeout(() => this.sendToClient({ type: "pty-write", text: "\r", raw: true }), 200);
-    }
     this.update("thinking");
     this.provider.send({
       embed: {

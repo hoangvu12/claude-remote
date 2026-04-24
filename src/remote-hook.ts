@@ -12,6 +12,9 @@ interface HookInput {
   session_id: string;
   hook_event_name: string;
   prompt: string;
+  /** Present when the UserPromptSubmit fires from inside a subagent run. */
+  agent_id?: string;
+  agent_type?: string;
 }
 
 function block(reason: string): never {
@@ -30,6 +33,12 @@ async function main() {
 
   if (!promptLower.startsWith("/remote")) {
     // Not our command — pass through
+    process.exit(0);
+  }
+
+  // Subagents shouldn't be able to toggle remote sync from inside a Task — the
+  // /remote control surface is user-facing. Silently pass through.
+  if (input.agent_id) {
     process.exit(0);
   }
 

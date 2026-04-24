@@ -40,13 +40,54 @@ export type ContentBlock =
   | ContentBlockThinking
   | ContentBlockImage;
 
+/**
+ * JSONL entry types Claude Code writes today (src/types/logs.ts Entry union)
+ * plus legacy types retained for backwards-compatibility when tailing older
+ * transcript files. Legacy types (progress, rate_limit_event, auth_status,
+ * tool_use_summary, tool_progress, prompt_suggestion, result) are no longer
+ * written by current Claude Code but may appear in pre-existing JSONLs —
+ * daemon.ts keeps defensive handlers for them.
+ */
+export type JSONLEntryType =
+  | "assistant"
+  | "user"
+  | "system"
+  | "attachment"
+  | "summary"
+  | "custom-title"
+  | "ai-title"
+  | "last-prompt"
+  | "task-summary"
+  | "tag"
+  | "pr-link"
+  | "attribution-snapshot"
+  | "file-history-snapshot"
+  | "queue-operation"
+  | "speculation-accept"
+  | "worktree-state"
+  | "mode"
+  | "content-replacement"
+  // Legacy — not emitted by current upstream, kept for old-transcript compat
+  | "progress"
+  | "result"
+  | "rate_limit_event"
+  | "auth_status"
+  | "tool_use_summary"
+  | "tool_progress"
+  | "prompt_suggestion";
+
 export interface JSONLMessage {
-  type: "assistant" | "user" | "system" | "progress" | "result" | "rate_limit_event" | "auth_status" | "tool_use_summary" | "tool_progress" | "prompt_suggestion" | "file-history-snapshot" | "queue-operation" | "last-prompt";
+  type: JSONLEntryType;
   uuid: string;
   parentUuid?: string;
   isSidechain?: boolean;
   timestamp: string;
   sessionId: string;
+  /**
+   * `system` subtype. High-value values we react to: `compact_boundary`,
+   * `microcompact_boundary`, `turn_duration`, `api_error`, `api_metrics`,
+   * `stop_hook_summary`. The rest we ignore.
+   */
   subtype?: string;
   permissionMode?: string;
   message?: {
@@ -56,9 +97,34 @@ export interface JSONLMessage {
     stop_reason?: string | null;
   };
   data?: Record<string, unknown>;
-  /** Parent Agent tool_use ID (for progress messages) */
+  /** Parent Agent tool_use ID (for sidechain/subagent work). */
   parentToolUseID?: string;
   toolUseID?: string;
+  /** Optional correlation fields upstream writes. */
+  cwd?: string;
+  version?: string;
+  gitBranch?: string;
+  /** `system` subtype-specific metadata. Shapes vary; access narrowly. */
+  compactMetadata?: {
+    trigger?: "manual" | "auto";
+    preTokens?: number;
+    userContext?: string;
+    messagesSummarized?: number;
+  };
+  microcompactMetadata?: {
+    trigger?: "auto";
+    preTokens?: number;
+    tokensSaved?: number;
+    compactedToolIds?: string[];
+    clearedAttachmentUUIDs?: string[];
+  };
+  durationMs?: number;
+  /** `api_error` subtype */
+  error?: string;
+  retryInMs?: number;
+  retryAttempt?: number;
+  maxRetries?: number;
+  level?: string;
 }
 
 // ── Config ──
@@ -89,6 +155,8 @@ export interface SessionInfoMessage {
   transcriptPath?: string;
   reuseChannelId?: string;
   initialPermissionMode?: string;
+  /** Why this session started: startup / resume / clear / compact. From SessionStart hook. */
+  sessionSource?: "startup" | "resume" | "clear" | "compact";
 }
 
 export interface SessionDisconnectMessage {
@@ -102,11 +170,28 @@ export interface DaemonReadyMessage {
   channelId: string;
 }
 
+export type StateSignalEvent =
+  | "stop"
+  | "post-compact"
+  | "pre-compact"
+  | "session-end"
+  | "notification";
+
 export interface DaemonStateSignalMessage {
   type: "state-signal";
   sessionKey: string;
-  event: "stop" | "post-compact";
+  event: StateSignalEvent;
   trigger?: "manual" | "auto";
+  /** For pre-compact — optional user-provided instructions. */
+  customInstructions?: string;
+  /** For session-end — why the session ended. */
+  reason?: "clear" | "resume" | "logout" | "prompt_input_exit" | "other" | "bypass_permissions_disabled";
+  /** For notification — type of notification and free-form message. */
+  notificationType?: "permission_prompt" | "elicitation_dialog" | "elicitation_url_dialog" | "worker_permission_prompt" | "auth_success" | string;
+  message?: string;
+  title?: string;
+  /** For stop — optional trailing assistant text from the turn. */
+  lastAssistantMessage?: string;
 }
 
 export interface DaemonRestartMessage {
@@ -138,12 +223,20 @@ export interface PipeSessionRegisterMessage {
   sessionId: string;
   transcriptPath: string;
   cwd?: string;
+  /** Why this session started (from SessionStart payload.source). */
+  source?: "startup" | "resume" | "clear" | "compact";
 }
 
 export interface PipeStateSignalMessage {
   type: "state-signal";
-  event: "stop" | "post-compact";
+  event: StateSignalEvent;
   trigger?: "manual" | "auto";
+  customInstructions?: string;
+  reason?: DaemonStateSignalMessage["reason"];
+  notificationType?: DaemonStateSignalMessage["notificationType"];
+  message?: string;
+  title?: string;
+  lastAssistantMessage?: string;
 }
 
 export type PipeMessage = PipeEnableMessage | PipeDisableMessage | PipeStatusMessage | PipeSessionRegisterMessage | PipeStateSignalMessage;
@@ -159,6 +252,8 @@ export type DiscordMessageType =
   | "ask-user-question"
   | "rewind"
   | "turn-duration"
+  | "api-error"
+  | "microcompact"
   | "status";
 
 export interface ProcessedMessage {

@@ -12,10 +12,45 @@ import fs from "node:fs";
 import path from "node:path";
 import { STATUS_FLAG, CONFIG_DIR } from "./utils.js";
 
+/**
+ * Shape of `buildStatusLineCommandInput` from upstream (components/StatusLine.tsx).
+ * All fields are optional — upstream adds fields over time and we only render
+ * what's present.
+ */
 interface SessionData {
-  model?: { display_name?: string };
-  context_window?: { used_percentage?: number };
-  cost?: { total_cost_usd?: number };
+  session_id?: string;
+  transcript_path?: string;
+  cwd?: string;
+  permission_mode?: string;
+  session_name?: string;
+  version?: string;
+  model?: { id?: string; display_name?: string };
+  workspace?: { current_dir?: string; project_dir?: string; added_dirs?: string[] };
+  output_style?: { name?: string };
+  cost?: {
+    total_cost_usd?: number;
+    total_duration_ms?: number;
+    total_api_duration_ms?: number;
+    total_lines_added?: number;
+    total_lines_removed?: number;
+  };
+  context_window?: {
+    total_input_tokens?: number;
+    total_output_tokens?: number;
+    context_window_size?: number;
+    current_usage?: number;
+    used_percentage?: number;
+    remaining_percentage?: number;
+  };
+  exceeds_200k_tokens?: boolean;
+  rate_limits?: {
+    five_hour?: { used_percentage?: number; resets_at?: string };
+    seven_day?: { used_percentage?: number; resets_at?: string };
+  };
+  vim?: { mode?: string };
+  agent?: { name?: string };
+  remote?: { session_id?: string };
+  worktree?: { name?: string; path?: string; branch?: string; original_cwd?: string; original_branch?: string };
 }
 
 // Read session JSON from stdin
@@ -30,6 +65,11 @@ process.stdin.on("end", () => {
   const model = session.model?.display_name || "Claude";
   const context = session.context_window?.used_percentage ?? 0;
   const cost = session.cost?.total_cost_usd;
+  const exceeds200k = session.exceeds_200k_tokens === true;
+  const rateFiveHour = session.rate_limits?.five_hour?.used_percentage;
+  const worktree = session.worktree;
+  const outputStyle = session.output_style?.name;
+  const vimMode = session.vim?.mode;
 
   // Check if Discord RC daemon is active for THIS session.
   // CLAUDE_REMOTE_PIPE is only set when running under claude-remote (rc.ts).
@@ -54,13 +94,36 @@ process.stdin.on("end", () => {
     ? "\x1b[32m● On\x1b[0m"   // green dot
     : "\x1b[90m○ Off\x1b[0m"; // dim
 
+  const ctxLabel = exceeds200k
+    ? `\x1b[31m${Math.round(context)}% ctx!\x1b[0m`
+    : context >= 80
+      ? `\x1b[33m${Math.round(context)}% ctx\x1b[0m`
+      : `${Math.round(context)}% ctx`;
+
   const parts = [
     `[${model}]`,
-    `${Math.round(context)}% ctx`,
+    ctxLabel,
   ];
 
   if (cost !== undefined) {
     parts.push(`$${cost.toFixed(3)}`);
+  }
+
+  if (rateFiveHour !== undefined && rateFiveHour >= 80) {
+    // Warn when the 5h rate-limit bucket is getting full.
+    parts.push(`\x1b[33m${Math.round(rateFiveHour)}% 5h\x1b[0m`);
+  }
+
+  if (worktree?.name) {
+    parts.push(`\x1b[36m⎇ ${worktree.name}\x1b[0m`);
+  }
+
+  if (vimMode) {
+    parts.push(`\x1b[35m${vimMode.toUpperCase()}\x1b[0m`);
+  }
+
+  if (outputStyle && outputStyle !== "default") {
+    parts.push(`\x1b[90m(${outputStyle})\x1b[0m`);
   }
 
   parts.push(`Remote: ${rcStatus}`);

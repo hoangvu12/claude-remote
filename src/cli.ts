@@ -67,7 +67,7 @@ function getStatuslineCommand(): string {
 
 // ── Skill & statusline management ──
 
-const HOOK_EVENT_TYPES = ["UserPromptSubmit", "SessionStart", "Stop", "PostCompact"];
+const HOOK_EVENT_TYPES = ["UserPromptSubmit", "SessionStart", "SessionEnd", "Stop", "PreCompact", "PostCompact", "Notification"];
 const HOOK_SCRIPT_NAMES = ["remote-hook", "discord-hook", "session-hook", "state-hook"];
 
 function isOurHook(h: Record<string, string>): boolean {
@@ -147,8 +147,11 @@ If you see this text, the hook did not intercept the prompt — run \`claude-rem
 
   addHook("UserPromptSubmit", "remote-hook");
   addHook("SessionStart", "session-hook");
+  addHook("SessionEnd", "state-hook");
   addHook("Stop", "state-hook");
+  addHook("PreCompact", "state-hook");
   addHook("PostCompact", "state-hook");
+  addHook("Notification", "state-hook");
 
   settings.hooks = hooks;
 

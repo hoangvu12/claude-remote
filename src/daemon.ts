@@ -27,7 +27,9 @@ const RELOAD_EXIT_CODE = 42;
 const BATCH_DELAY = 600;
 const KEY_DELAY = 150;
 const ARROW_DOWN = "\x1b[B";
+const ARROW_UP = "\x1b[A";
 const ENTER = "\r";
+const ESCAPE = "\x1b";
 const SPACE = " ";
 const TAB = "\t";
 const REPLAY_FULL = 5;
@@ -207,9 +209,14 @@ function submitAskAnswers(session: Session, toolUseId: string) {
 
     let keysDelay: number;
     if (answer.customText != null) {
-      write({ type: "pty-write", text: answer.customText });
-      setTimeout(() => write({ type: "pty-write", text: ENTER, raw: true }), KEY_DELAY);
-      keysDelay = KEY_DELAY * 2;
+      // "Other" is always the last option (upstream auto-appends an input-
+      // type "__other__" entry). Focus it via ARROW_UP (wraps from first)
+      // so the TextInput is focused before we type — otherwise the letters
+      // land on the Select component, which ignores non-digits.
+      write({ type: "pty-write", text: ARROW_UP, raw: true });
+      setTimeout(() => write({ type: "pty-write", text: answer.customText! }), KEY_DELAY);
+      setTimeout(() => write({ type: "pty-write", text: ENTER, raw: true }), KEY_DELAY * 2);
+      keysDelay = KEY_DELAY * 3;
     } else if (answer.isMultiSelect) {
       const toggleKeys = answer.keys;
       const cursorPos = answer.multiSelectLastTogglePos ?? 0;
@@ -710,10 +717,15 @@ function wireDiscordInput(session: Session) {
           }
         }
         if (paths.length > 0) {
-          const pathList = paths.map((p) => p.replace(/\\/g, "/")).join(" ");
+          // Each path on its own line with native separators so Claude Code's
+          // paste handler (imagePaste.ts) recognizes them as absolute image
+          // paths and attaches the real image instead of treating the whole
+          // line as a failed path. On Windows, stripBackslashEscapes is a
+          // no-op — don't replace backslashes with forward slashes.
+          const pathList = paths.join("\n");
           finalText = finalText
-            ? `${finalText} (see attached image: ${pathList})`
-            : `Please look at this image: ${pathList}`;
+            ? `${finalText}\n${pathList}`
+            : `Please look at this image:\n${pathList}`;
         }
       }
 
@@ -731,9 +743,6 @@ function wireDiscordInput(session: Session) {
       activity.resetIdleTimer();
       ctx.originMessages.add(finalText);
       write({ type: "pty-write", text: finalText });
-      if (finalText.includes("\n")) {
-        setTimeout(() => write({ type: "pty-write", text: "\r", raw: true }), 200);
-      }
       activity.update("thinking", discordClient!);
     });
 
@@ -751,7 +760,12 @@ function wireDiscordInput(session: Session) {
       if (id.startsWith(ID_PREFIX.DENY)) {
         const toolUseId = id.slice(ID_PREFIX.DENY.length);
         ctx.resolvedToolUseIds.add(toolUseId);
-        sendKeySequence(session, [ARROW_DOWN, ENTER]);
+        // Escape triggers PermissionPrompt's handleCancel → onReject, which is
+        // equivalent to selecting "No" regardless of how many options the dialog
+        // shows. Arrow-down+Enter was index 1, which in the 3-option dialog
+        // ([Yes, Yes-dont-ask-again, No] when showAlwaysAllowOptions=true) picks
+        // "Yes, don't ask again" — the opposite of Deny.
+        sendKeySequence(session, [ESCAPE]);
         provider.respond(interaction, { text: "❌ Denied" });
         return;
       }
@@ -891,16 +905,21 @@ function wireDiscordInput(session: Session) {
         if (id.includes(ID_PREFIX.PLAN_FEEDBACK)) {
           const feedback = interaction.text?.trim();
           if (feedback) {
-            write({ type: "pty-write", text: "4", raw: true });
-            setTimeout(() => {
-              write({ type: "pty-write", text: feedback, raw: true });
-              setTimeout(() => write({ type: "pty-write", text: "\r", raw: true }), 100);
-            }, 100);
+            // "No, keep planning" is always the last option in the plan-
+            // approval dialog. Its digit isn't fixed — buildPlanApprovalOptions
+            // conditionally adds/removes slots based on showClearContext,
+            // showUltraplan, auto-mode, and bypass-permissions. ARROW_UP
+            // wraps from the first option to the last (Select wraps when
+            // onUpFromFirstItem isn't set, which it isn't for plan mode),
+            // reliably focusing the input option regardless of layout.
+            write({ type: "pty-write", text: ARROW_UP, raw: true });
+            setTimeout(() => write({ type: "pty-write", text: feedback }), KEY_DELAY);
+            setTimeout(() => write({ type: "pty-write", text: ENTER, raw: true }), KEY_DELAY * 2);
             provider.respond(interaction, {
               embed: { description: `📐 Keep planning: ${feedback}`, color: 0xf5a623 },
             });
           } else {
-            write({ type: "pty-write", text: "\x1b", raw: true });
+            write({ type: "pty-write", text: ESCAPE, raw: true });
             provider.respond(interaction, {
               embed: { description: "📐 Staying in plan mode", color: 0xf5a623 },
             });
@@ -924,7 +943,11 @@ function wireDiscordInput(session: Session) {
                 : `Answered: **${text}** (${state.answers.size}/${state.totalQuestions})`,
             });
           } else {
-            write({ type: "pty-write", text });
+            // Single-question "Other": focus the auto-added last input option
+            // via ARROW_UP (wraps from first), then type, then Enter.
+            write({ type: "pty-write", text: ARROW_UP, raw: true });
+            setTimeout(() => write({ type: "pty-write", text }), KEY_DELAY);
+            setTimeout(() => write({ type: "pty-write", text: ENTER, raw: true }), KEY_DELAY * 2);
             provider.respond(interaction, { text: `Answered: **${text}**` });
           }
           return;
@@ -949,8 +972,9 @@ async function createSession(msg: ClientToDaemon & { type: "session-info" }, soc
   const reuseChannelId = msg.reuseChannelId;
   const initialPermissionMode = msg.initialPermissionMode || "default";
   const customChannelName = msg.channelName;
+  const sessionSource = msg.sessionSource;
 
-  console.log(`[daemon] Creating session ${sessionKey} (session ${sessionId})`);
+  console.log(`[daemon] Creating session ${sessionKey} (session ${sessionId}, source=${sessionSource || "unknown"})`);
 
   const guild = await discordClient.guilds.fetch(guildId);
 
@@ -1013,6 +1037,8 @@ async function createSession(msg: ClientToDaemon & { type: "session-info" }, soc
     projectDir,
     provider,
     permissionMode: initialPermissionMode,
+    bypassAvailable: initialPermissionMode === "bypassPermissions",
+    sessionSource,
     resolvedToolUseIds: new Set<string>(),
     originMessages: new Set<string>(),
     sendToPty: (text: string) => write({ type: "pty-write", text }),
@@ -1056,8 +1082,12 @@ async function createSession(msg: ClientToDaemon & { type: "session-info" }, soc
 
   wireDiscordInput(session);
 
-  if (isContextClear) {
+  if (sessionSource === "resume" && !isContextClear) {
+    await provider.send({ text: `↩️ **Resumed session** \`${sessionId.slice(0, 8)}\`` });
+  } else if (isContextClear || sessionSource === "clear") {
     await provider.send({ text: "🧹 **Context cleared** — new conversation started" });
+  } else if (sessionSource === "compact") {
+    await provider.send({ text: "🗜️ **New context window** — post-compact" });
   } else if (!savedChannelId) {
     await provider.send({ text: `🟢 **Discord sync enabled**\n📁 \`${projectDir}\`\n🆔 \`${sessionId.slice(0, 8)}\`` });
   } else {
@@ -1118,6 +1148,70 @@ function handleConnection(socket: net.Socket) {
   });
 }
 
+async function handleStateSignal(session: Session, msg: Extract<ClientToDaemon, { type: "state-signal" }>) {
+  const { activity, ctx } = session;
+  switch (msg.event) {
+    case "stop":
+      // Turn finished. If the hook payload carries a closing message we could
+      // surface it, but the transcript already has the assistant text — so the
+      // signal is purely a state transition.
+      activity.transitionToIdle();
+      break;
+    case "post-compact":
+      if (msg.trigger === "manual") activity.transitionToIdle();
+      // Auto compact boundary is already rendered from the JSONL compact_boundary
+      // event; we just use the state change signal here.
+      break;
+    case "pre-compact": {
+      const scope = msg.trigger === "manual" ? "manual" : "auto";
+      const hint = msg.customInstructions ? `\n> ${truncate(msg.customInstructions, 300)}` : "";
+      await ctx.provider.send({
+        embed: {
+          description: `🗜️ **Compacting context** (${scope})${hint}`,
+          color: 0xf5a623,
+        },
+      });
+      break;
+    }
+    case "session-end": {
+      // Clean exits aren't crashes; announce and clear activity but keep the
+      // channel mapping so a subsequent `claude --resume` lands in the same thread.
+      const reason = msg.reason || "other";
+      const reasonLabels: Record<string, string> = {
+        logout: "Signed out",
+        prompt_input_exit: "User exited",
+        clear: "Context cleared",
+        resume: "Resumed elsewhere",
+        bypass_permissions_disabled: "Bypass permissions disabled",
+        other: "Session ended",
+      };
+      await ctx.provider.send({
+        embed: { description: `👋 **${reasonLabels[reason] || reason}**`, color: COLOR.BLURPLE },
+      });
+      activity.busy = false;
+      activity.update("idle");
+      break;
+    }
+    case "notification": {
+      const nt = msg.notificationType || "notification";
+      // These are surfaced by the permission/elicitation UIs themselves via
+      // tool_use blocks, so we only emit a line for channel-visible signals
+      // that have no other representation.
+      if (nt === "auth_success") {
+        await ctx.provider.send({ text: "🔑 Authenticated" });
+      } else if (nt === "worker_permission_prompt") {
+        const body = msg.message ? `: ${truncate(msg.message, 200)}` : "";
+        await ctx.provider.send({
+          embed: { description: `👷 **Worker permission requested**${body}`, color: 0xf5a623 },
+        });
+      }
+      // permission_prompt / elicitation_dialog are already covered by the
+      // tool-use rendering path; we skip them to avoid double-posts.
+      break;
+    }
+  }
+}
+
 async function handleClientMessage(msg: ClientToDaemon, socket: net.Socket) {
   if (msg.type === "session-info") {
     // If this session already exists (reconnect), clean up old one first
@@ -1133,9 +1227,7 @@ async function handleClientMessage(msg: ClientToDaemon, socket: net.Socket) {
   } else if (msg.type === "state-signal") {
     const session = sessions.get(msg.sessionKey);
     if (!session) return;
-    if (msg.event === "stop" || (msg.event === "post-compact" && msg.trigger === "manual")) {
-      session.activity.transitionToIdle();
-    }
+    await handleStateSignal(session, msg);
   } else if (msg.type === "session-disconnect") {
     await cleanupSession(msg.sessionKey);
   }

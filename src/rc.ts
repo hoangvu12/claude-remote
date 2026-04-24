@@ -32,6 +32,7 @@ let lastChannelId: string | null = null;
 let connecting = false;
 let restarting = false;
 let proc: IPty | null = null;
+let sessionSource: "startup" | "resume" | "clear" | "compact" | undefined;
 
 // ── Terminal restore (Windows ConPTY leaves win32-input-mode enabled) ──
 
@@ -112,6 +113,7 @@ function startPipeServer() {
           sessionId = msg.sessionId;
           transcriptPath = msg.transcriptPath;
           if (msg.cwd) projectDir = msg.cwd;
+          sessionSource = msg.source;
 
           if (daemonWasEnabled && oldSessionId && oldSessionId !== sessionId) {
             disconnectDaemon();
@@ -132,8 +134,19 @@ function startPipeServer() {
           disconnectDaemon();
           socket.write(JSON.stringify({ status: "ok", active: false }));
         } else if (msg.type === "state-signal") {
-          // Relay state-signal to daemon with sessionKey
-          sendToDaemon({ type: "state-signal", sessionKey: SESSION_KEY, event: msg.event, trigger: msg.trigger });
+          // Relay state-signal to daemon with sessionKey; forward all optional fields.
+          sendToDaemon({
+            type: "state-signal",
+            sessionKey: SESSION_KEY,
+            event: msg.event,
+            trigger: msg.trigger,
+            customInstructions: msg.customInstructions,
+            reason: msg.reason,
+            notificationType: msg.notificationType,
+            message: msg.message,
+            title: msg.title,
+            lastAssistantMessage: msg.lastAssistantMessage,
+          });
           socket.write(JSON.stringify({ status: "ok" }));
         } else if (msg.type === "status") {
           socket.write(JSON.stringify({ status: "ok", active: daemonSocket !== null }));
@@ -198,8 +211,16 @@ function handleDaemonMessage(msg: DaemonToClient) {
   if (msg.type === "pty-write") {
     if (msg.raw) {
       proc?.write(msg.text);
-    } else if (msg.text.includes("\n")) {
+    } else if (msg.text.includes("\n") || msg.text.length >= 800) {
+      // Claude Code debounces paste completion by 100ms (usePasteHandler.ts)
+      // and auto-treats any chunk >800 chars as paste. Appending \r to the
+      // same write gets it absorbed into the paste buffer as a literal
+      // newline instead of a submit, so send \r on a delayed timer well
+      // clear of the 100ms debounce. Second \r is a safety retry; Enter on
+      // an empty prompt is a no-op.
       proc?.write(`\x1b[200~${msg.text}\x1b[201~`);
+      setTimeout(() => proc?.write("\r"), 400);
+      setTimeout(() => proc?.write("\r"), 900);
     } else {
       proc?.write(msg.text + "\r");
     }
@@ -214,19 +235,17 @@ function handleDaemonMessage(msg: DaemonToClient) {
 function restartClaude() {
   if (restarting || !proc) return;
   restarting = true;
-  // Send Ctrl+C then Ctrl+D to exit Claude gracefully
-  proc.write("\x03");
+  // Claude Code's useExitOnCtrlCD wants two presses of the SAME key within a
+  // ~2s window. Mixing Ctrl+C and Ctrl+D resets each other's pending state and
+  // never confirms. Cancel any in-flight work with Escape first, then double
+  // Ctrl+D to cleanly exit.
+  proc.write("\x1b");
   setTimeout(() => {
-    proc?.write("\x03");
+    proc?.write("\x04");
+    setTimeout(() => proc?.write("\x04"), 250);
     setTimeout(() => {
-      proc?.write("\x04");
-      // If Claude doesn't exit within 3s, force kill
-      setTimeout(() => {
-        if (restarting && proc) {
-          proc.kill();
-        }
-      }, 3000);
-    }, 300);
+      if (restarting && proc) proc.kill();
+    }, 3000);
   }, 300);
 }
 
@@ -282,6 +301,7 @@ function connectToDaemon(channelName?: string) {
         transcriptPath: transcriptPath || undefined,
         reuseChannelId: lastChannelId || undefined,
         initialPermissionMode,
+        sessionSource,
       });
 
       // Handle incoming messages from daemon (JSONL framing)

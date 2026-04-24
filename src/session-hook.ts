@@ -21,7 +21,7 @@ async function main() {
   const input = Buffer.concat(chunks).toString("utf-8").trim();
   if (!input) process.exit(0);
 
-  let payload: { session_id?: string; transcript_path?: string; cwd?: string };
+  let payload: { session_id?: string; transcript_path?: string; cwd?: string; source?: "startup" | "resume" | "clear" | "compact" };
   try {
     payload = JSON.parse(input);
   } catch {
@@ -36,6 +36,7 @@ async function main() {
       sessionId: payload.session_id,
       transcriptPath: payload.transcript_path,
       cwd: payload.cwd,
+      source: payload.source,
     });
   } catch {
     // best effort — pipe might not be ready yet
