@@ -218,9 +218,18 @@ function handleDaemonMessage(msg: DaemonToClient) {
       // newline instead of a submit, so send \r on a delayed timer well
       // clear of the 100ms debounce. Second \r is a safety retry; Enter on
       // an empty prompt is a no-op.
+      //
+      // For image-path pastes, usePasteHandler kicks off async Sharp resize
+      // (imageResizer.ts) inside Promise.all before calling onImagePaste.
+      // On Windows the cold-start of Sharp regularly exceeds 300ms, so a
+      // 400ms Enter races the resize and submits an empty/partial buffer.
+      // Use a much longer delay when the paste contains an image path.
+      const hasImagePath = /\.(png|jpe?g|gif|webp)(\s|$)/i.test(msg.text);
+      const firstEnter = hasImagePath ? 1500 : 400;
+      const secondEnter = hasImagePath ? 3000 : 900;
       proc?.write(`\x1b[200~${msg.text}\x1b[201~`);
-      setTimeout(() => proc?.write("\r"), 400);
-      setTimeout(() => proc?.write("\r"), 900);
+      setTimeout(() => proc?.write("\r"), firstEnter);
+      setTimeout(() => proc?.write("\r"), secondEnter);
     } else {
       proc?.write(msg.text + "\r");
     }

@@ -710,6 +710,14 @@ function wireDiscordInput(session: Session) {
             const ext = att.filename.split(".").pop() || "png";
             const tmpPath = path.join(os.tmpdir(), `claude-remote-${Date.now()}-${Math.random().toString(36).slice(2)}.${ext}`);
             fs.writeFileSync(tmpPath, buf);
+            // Surface zero-byte / unreadable downloads in the log — Claude Code's
+            // tryReadImageFromPath silently returns null on a 0-byte file and
+            // the image attachment is dropped without warning.
+            const size = fs.statSync(tmpPath).size;
+            console.log(`[daemon] Saved image ${att.filename} → ${tmpPath} (${size} bytes)`);
+            if (size === 0) {
+              console.error(`[daemon] WARNING: ${tmpPath} is empty — Claude will drop this attachment`);
+            }
             session.tempFiles.add(tmpPath);
             paths.push(tmpPath);
           } catch (err) {
