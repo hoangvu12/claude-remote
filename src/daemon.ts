@@ -15,6 +15,7 @@ import type { SessionContext } from "./handler.js";
 import type { HandlerPipeline } from "./pipeline.js";
 import { hasInput, hasThreads } from "./provider.js";
 import { toolState } from "./handlers/tool-state.js";
+import { renderPermissionPrompt } from "./handlers/tool-use.js";
 import { closePassiveGroup } from "./handlers/passive-tools.js";
 import { closeAllMcpGroups } from "./handlers/mcp-tools.js";
 import { ActivityManager } from "./activity.js";
@@ -1412,6 +1413,21 @@ function handlePermissionRequest(
     writeBack({ behavior: "passthrough" });
   }, HOOK_RESPONSE_WINDOW_MS);
   pendingPermissions.set(msg.toolUseId, { socket, timer });
+
+  // Render Allow/Deny in Discord. The hook firing is the authoritative signal
+  // that Claude actually wants permission — independent of permissionMode, so
+  // bypass-immune safety checks (e.g. ~/.claude/settings.json edits) get
+  // buttons too. If the tool's thread exists, post directly; otherwise stash
+  // and let the tool-use handler render on thread creation.
+  const entry = toolState.toolUseThreads.get(msg.toolUseId);
+  const provider = session.ctx.provider;
+  if (entry?.thread && hasThreads(provider)) {
+    renderPermissionPrompt(entry, msg.toolUseId, provider).catch((err) => {
+      console.error("[daemon] Failed to render permission prompt:", err);
+    });
+  } else {
+    toolState.permissionPending.add(msg.toolUseId);
+  }
 }
 
 /**
@@ -1425,6 +1441,7 @@ function resolvePermissionViaHook(
   const pending = pendingPermissions.get(toolUseId);
   if (!pending) return false;
   pendingPermissions.delete(toolUseId);
+  toolState.permissionPending.delete(toolUseId);
   clearTimeout(pending.timer);
   try {
     pending.socket.write(JSON.stringify(decision) + "\n");

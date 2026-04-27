@@ -53,6 +53,15 @@ export interface McpGroup {
 export const toolState = {
   toolUseThreads: new Map<string, ToolEntry>(),
 
+  /**
+   * toolUseIds for which Claude Code's PermissionRequest hook has fired but
+   * we haven't yet rendered Allow/Deny buttons in Discord (race: hook can
+   * arrive before the JSONL tool_use line is parsed). The tool-use handler
+   * checks this set on entry creation; the daemon's permission renderer
+   * checks the toolUseThreads map first and falls back to this set.
+   */
+  permissionPending: new Set<string>(),
+
   activePassiveGroup: null as {
     counts: Map<string, number>;
     toolUseIds: Set<string>;

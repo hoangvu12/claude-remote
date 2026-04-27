@@ -19,7 +19,38 @@ function formatElapsed(ms: number): string {
   return `${Math.floor(s / 60)}m ${s % 60}s`;
 }
 
-/** Escalate an unresolved tool to a thread with permission prompt and progress timer */
+/**
+ * Post the Allow/Deny prompt into a tool's thread. Used by:
+ *  - escalateToThread, when we know a permission is pending at thread creation
+ *    (PermissionRequest hook arrived before the FAST_RESULT_WINDOW expired)
+ *  - daemon's handlePermissionRequest, when the hook arrives after the thread
+ *    already exists (the common case for slow tools like Bash)
+ *
+ * Rendering is keyed off the actual hook firing — NOT permissionMode — because
+ * Claude Code's safety-check branch (e.g. `~/.claude/settings.json` edits) asks
+ * for permission even when --dangerously-skip-permissions is on, and the user
+ * needs buttons in those cases too.
+ */
+export async function renderPermissionPrompt(
+  entry: ToolEntry,
+  toolUseId: string,
+  provider: OutputProvider & { sendToThread: Function },
+): Promise<void> {
+  if (!entry.thread) return;
+  await provider.sendToThread(entry.thread, {
+    embed: {
+      title: "⚠️ Permission needed",
+      description: `**${entry.toolName}** ${entry.content}`,
+      color: COLOR.PERMISSION,
+    },
+    actions: [
+      { id: `${ID_PREFIX.ALLOW}${toolUseId}`, label: "Allow", style: "success" },
+      { id: `${ID_PREFIX.DENY}${toolUseId}`, label: "Deny", style: "danger" },
+    ],
+  });
+}
+
+/** Escalate an unresolved tool to a thread; render permission prompt if a hook is already pending. */
 async function escalateToThread(
   entry: ToolEntry,
   toolUseId: string,
@@ -45,19 +76,11 @@ async function escalateToThread(
     }
   }
 
-  // Permission prompt (only if not in bypass mode)
-  if (ctx.permissionMode !== "bypassPermissions") {
-    await provider.sendToThread(entry.thread, {
-      embed: {
-        title: "⚠️ Permission needed",
-        description: `**${entry.toolName}** ${entry.content}`,
-        color: COLOR.PERMISSION,
-      },
-      actions: [
-        { id: `${ID_PREFIX.ALLOW}${toolUseId}`, label: "Allow", style: "success" },
-        { id: `${ID_PREFIX.DENY}${toolUseId}`, label: "Deny", style: "danger" },
-      ],
-    });
+  // If the PermissionRequest hook already fired for this tool while we were
+  // waiting on FAST_RESULT_WINDOW, render the prompt now.
+  if (toolState.permissionPending.has(toolUseId)) {
+    toolState.permissionPending.delete(toolUseId);
+    await renderPermissionPrompt(entry, toolUseId, provider);
   }
 
   // Start progress timer — shows elapsed time in thread
@@ -118,9 +141,12 @@ export class ToolUseHandler implements MessageHandler {
 
     if (hasThreads(provider)) {
       const toolUseId = pm.toolUseId;
+      // Escalate immediately for THREAD_TOOLS (Bash/Agent) OR when the
+      // PermissionRequest hook already fired for this tool — waiting another
+      // 300ms would leave the user staring at an unanswerable prompt.
+      const needPermission = toolState.permissionPending.has(toolUseId);
 
-      if (immediate) {
-        // Bash/Agent → thread immediately
+      if (immediate || needPermission) {
         await escalateToThread(entry, toolUseId, ctx, provider);
       } else {
         // Short window for fast results — escalate to thread if no result arrives
