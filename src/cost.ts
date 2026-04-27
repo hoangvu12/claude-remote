@@ -141,3 +141,16 @@ export function renderContextBar(usedPct: number): { bar: string; color: number;
 
 /** Default context window size for cost/% computation. Modern Claude is 200k. */
 export const DEFAULT_CONTEXT_WINDOW = 200_000;
+
+/**
+ * Mirrors upstream `getContextWindowForModel` (utils/context.ts:51) — picks
+ * 1M for explicitly-flagged models, 200k otherwise. We don't have access to
+ * the SDK beta headers here, so 1M only kicks in when the model id carries
+ * the `[1m]` suffix (the explicit client-side opt-in upstream respects over
+ * all other detection).
+ */
+export function getContextWindowForModel(model: string | undefined | null): number {
+  if (!model) return DEFAULT_CONTEXT_WINDOW;
+  if (/\[1m\]/i.test(model)) return 1_000_000;
+  return DEFAULT_CONTEXT_WINDOW;
+}

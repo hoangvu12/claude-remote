@@ -22,7 +22,7 @@ import { startSubagentWatcher, flushAndStopSubagentWatcher, stopAllSubagentWatch
 import { ActivityManager } from "./activity.js";
 import { setupSlashCommands } from "./slash-commands.js";
 import { ensureHooksInstalled } from "./install-hooks.js";
-import { calculateUSDCost, formatTokens, formatUSD, renderContextBar, DEFAULT_CONTEXT_WINDOW } from "./cost.js";
+import { calculateUSDCost, formatTokens, formatUSD, renderContextBar, getContextWindowForModel } from "./cost.js";
 
 // ── Constants ──
 
@@ -376,8 +376,9 @@ async function handleFileChange(session: Session, filePath: string) {
       }
 
       // Accumulate per-turn usage so the Stop-event handler can render a
-      // cost + token + context-% footer. `input_tokens` on the latest turn
-      // doubles as the current context size (input includes full history).
+      // cost + token + context-% footer. With prompt caching, `input_tokens`
+      // only counts the non-cached delta — the real context size is
+      // input + cache_read + cache_creation. We track that sum for the % bar.
       if (msg.type === "assistant" && msg.message?.usage) {
         const u = msg.message.usage;
         const model = msg.message.model;
@@ -388,7 +389,10 @@ async function handleFileChange(session: Session, filePath: string) {
         session.totalUsage.cacheRead += u.cache_read_input_tokens ?? 0;
         session.totalUsage.cacheCreate += u.cache_creation_input_tokens ?? 0;
         session.totalUsage.cost += cost;
-        if (u.input_tokens != null) session.lastInputTokens = u.input_tokens;
+        const turnContext = (u.input_tokens ?? 0)
+          + (u.cache_read_input_tokens ?? 0)
+          + (u.cache_creation_input_tokens ?? 0);
+        if (turnContext > 0) session.lastInputTokens = turnContext;
       }
 
       if (msg.type === "user" && msg.message && Array.isArray(msg.message.content)) {
@@ -1519,7 +1523,15 @@ async function handleStateSignal(session: Session, msg: Extract<ClientToDaemon, 
         const cachePct = cacheTotal + u.input > 0
           ? Math.round((u.cacheRead / (cacheTotal + u.input)) * 100)
           : 0;
-        const ctxPct = (session.lastInputTokens / DEFAULT_CONTEXT_WINDOW) * 100;
+        // Pick the context window: explicit [1m] suffix wins, else infer
+        // from observed usage. JSONL strips the [1m] suffix from `model`,
+        // so an Opus 4.7 [1m] turn shows up as plain `claude-opus-4-7`. If
+        // we've already observed >200k tokens without an auto-compact, the
+        // model must be ≥1M-context — fall back to 1M to avoid pegging the
+        // bar at 100% for users on 1M-capable models.
+        const declared = getContextWindowForModel(session.lastModel);
+        const ctxWindow = session.lastInputTokens > declared ? 1_000_000 : declared;
+        const ctxPct = (session.lastInputTokens / ctxWindow) * 100;
         const ctxBar = renderContextBar(ctxPct);
         const parts = [
           `${formatTokens(u.input)} in`,
@@ -1528,12 +1540,7 @@ async function handleStateSignal(session: Session, msg: Extract<ClientToDaemon, 
         if (cacheTotal > 0) parts.push(`cache ${cachePct}%`);
         parts.push(formatUSD(u.cost));
         parts.push(ctxBar.bar);
-        await ctx.provider.send({
-          embed: {
-            description: `*${parts.join(" · ")}*`,
-            color: ctxBar.color,
-          },
-        });
+        await ctx.provider.send({ text: `-# ${parts.join(" · ")}` });
       }
       activity.transitionToIdle();
       break;
