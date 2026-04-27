@@ -1630,10 +1630,12 @@ async function handleStateSignal(session: Session, msg: Extract<ClientToDaemon, 
         // Claude is idle and waiting for input — REPL.tsx ~line 3936 emits
         // this when the user has been away for a while. Ping the session
         // initiator so they get a phone push without scrolling Discord.
+        // Use the hook's `message` text directly (it already reads "Claude
+        // is waiting for your input") to avoid double-saying it.
         const mention = session.initiatorUserId ? `<@${session.initiatorUserId}> ` : "";
-        const body = msg.message ? `: ${truncate(msg.message, 200)}` : "";
+        const text = msg.message?.trim() || "Claude is waiting for your input";
         await ctx.provider.send({
-          text: `${mention}🔔 Claude is waiting for input${body}`,
+          text: `${mention}🔔 ${truncate(text, 200)}`,
         });
       }
       // permission_prompt / elicitation_dialog are already covered by the
