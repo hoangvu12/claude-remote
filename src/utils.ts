@@ -38,6 +38,8 @@ export function getClaudeDir(): string {
 
 export const ID_PREFIX = {
   ALLOW: "allow:",
+  ALLOW_ALWAYS: "allow-always:",
+  EDIT_ALLOW: "edit-allow:",
   DENY: "deny:",
   ASK: "ask:",
   ASK_OTHER: "ask-other:",
@@ -70,6 +72,20 @@ export function resolveJSONLPath(sessionId: string, cwd: string): string {
   const claudeDir = path.join(getClaudeDir(), "projects");
   const encoded = encodeProjectPath(cwd);
   return path.join(claudeDir, encoded, `${sessionId}.jsonl`);
+}
+
+/**
+ * Subagent transcripts live one level under the parent session — verified
+ * against upstream `getAgentTranscriptPath` and the `subagents/agent-<id>.jsonl`
+ * naming pattern referenced in src/utils/stats.ts. Layout:
+ *   <claudeDir>/projects/<encoded-cwd>/<parentSessionId>/subagents/agent-<agentId>.jsonl
+ * The directory may not exist yet when SubagentStart fires; chokidar handles
+ * non-existent paths via its parent-directory fallback.
+ */
+export function resolveSubagentJSONLPath(parentSessionId: string, cwd: string, agentId: string): string {
+  const claudeDir = path.join(getClaudeDir(), "projects");
+  const encoded = encodeProjectPath(cwd);
+  return path.join(claudeDir, encoded, parentSessionId, "subagents", `agent-${agentId}.jsonl`);
 }
 
 /**

@@ -33,9 +33,17 @@ interface PermissionRequestHookInput {
   agent_id?: string;
 }
 
+interface PermissionUpdate {
+  type: "addRules" | "replaceRules" | "removeRules";
+  rules: Array<{ toolName: string; ruleContent?: string }>;
+  behavior: "allow" | "deny" | "ask";
+  destination: "userSettings" | "projectSettings" | "localSettings" | "session" | "cliArg";
+}
+
 interface DaemonDecision {
   behavior: "allow" | "deny" | "passthrough";
   updatedInput?: Record<string, unknown>;
+  updatedPermissions?: PermissionUpdate[];
   message?: string;
 }
 
@@ -120,6 +128,7 @@ async function main() {
           decision: {
             behavior: "allow" as const,
             ...(decision.updatedInput ? { updatedInput: decision.updatedInput } : {}),
+            ...(decision.updatedPermissions?.length ? { updatedPermissions: decision.updatedPermissions } : {}),
           },
         }
       : {

@@ -257,12 +257,14 @@ function handleDaemonMessage(msg: DaemonToClient) {
       //
       // For image-path pastes, usePasteHandler kicks off async Sharp resize
       // (imageResizer.ts) inside Promise.all before calling onImagePaste.
-      // On Windows the cold-start of Sharp regularly exceeds 300ms, so a
-      // 400ms Enter races the resize and submits an empty/partial buffer.
-      // Use a much longer delay when the paste contains an image path.
+      // On Windows the cold-start of Sharp regularly exceeds a second on
+      // mid-size JPGs (verified with a 148KB Discord screenshot at 1500ms —
+      // Enter raced the resize, message submitted text-only). Bump to 4s/8s
+      // — much safer headroom; the Enter is debounced so the second one is
+      // a no-op if the first already submitted.
       const hasImagePath = /\.(png|jpe?g|gif|webp)(\s|$)/i.test(msg.text);
-      const firstEnter = hasImagePath ? 1500 : 400;
-      const secondEnter = hasImagePath ? 3000 : 900;
+      const firstEnter = hasImagePath ? 4000 : 400;
+      const secondEnter = hasImagePath ? 8000 : 900;
       proc?.write(`\x1b[200~${msg.text}\x1b[201~`);
       setTimeout(() => proc?.write("\r"), firstEnter);
       setTimeout(() => proc?.write("\r"), secondEnter);

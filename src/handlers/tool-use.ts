@@ -31,22 +31,44 @@ function formatElapsed(ms: number): string {
  * for permission even when --dangerously-skip-permissions is on, and the user
  * needs buttons in those cases too.
  */
+/**
+ * Discord modal text inputs are capped at 4000 chars. Leave headroom for
+ * pretty-print whitespace + the JSON brackets we add. If the serialized input
+ * exceeds this, we hide the "Edit & Allow" button rather than silently
+ * truncating — the user can still Allow/Deny normally.
+ */
+const EDIT_ALLOW_INPUT_LIMIT = 3500;
+
 export async function renderPermissionPrompt(
   entry: ToolEntry,
   toolUseId: string,
   provider: OutputProvider & { sendToThread: Function },
+  toolInput?: Record<string, unknown>,
 ): Promise<void> {
   if (!entry.thread) return;
+  const actions: Array<{ id: string; label: string; style: "primary" | "success" | "danger" | "secondary" }> = [
+    { id: `${ID_PREFIX.ALLOW}${toolUseId}`, label: "Allow", style: "success" },
+    { id: `${ID_PREFIX.ALLOW_ALWAYS}${toolUseId}`, label: "Always Allow", style: "primary" },
+  ];
+  // Only offer "Edit & Allow" when (a) we have the input to pre-fill and (b)
+  // its JSON fits in a single Discord text input. JSON-stringified, not raw —
+  // matches what the modal will render.
+  if (toolInput) {
+    try {
+      const serialized = JSON.stringify(toolInput, null, 2);
+      if (serialized.length <= EDIT_ALLOW_INPUT_LIMIT) {
+        actions.push({ id: `${ID_PREFIX.EDIT_ALLOW}${toolUseId}`, label: "Edit & Allow", style: "secondary" });
+      }
+    } catch { /* circular or otherwise unserializable — skip the button */ }
+  }
+  actions.push({ id: `${ID_PREFIX.DENY}${toolUseId}`, label: "Deny", style: "danger" });
   await provider.sendToThread(entry.thread, {
     embed: {
       title: "⚠️ Permission needed",
       description: `**${entry.toolName}** ${entry.content}`,
       color: COLOR.PERMISSION,
     },
-    actions: [
-      { id: `${ID_PREFIX.ALLOW}${toolUseId}`, label: "Allow", style: "success" },
-      { id: `${ID_PREFIX.DENY}${toolUseId}`, label: "Deny", style: "danger" },
-    ],
+    actions,
   });
 }
 
@@ -56,6 +78,7 @@ async function escalateToThread(
   toolUseId: string,
   ctx: SessionContext,
   provider: OutputProvider & { createThread: Function; sendToThread: Function },
+  toolInput?: Record<string, unknown>,
 ) {
   // Delete inline embed — thread replaces it
   if (entry.inlineMessage) {
@@ -80,7 +103,7 @@ async function escalateToThread(
   // waiting on FAST_RESULT_WINDOW, render the prompt now.
   if (toolState.permissionPending.has(toolUseId)) {
     toolState.permissionPending.delete(toolUseId);
-    await renderPermissionPrompt(entry, toolUseId, provider);
+    await renderPermissionPrompt(entry, toolUseId, provider, toolInput);
   }
 
   // Start progress timer — shows elapsed time in thread
@@ -147,13 +170,13 @@ export class ToolUseHandler implements MessageHandler {
       const needPermission = toolState.permissionPending.has(toolUseId);
 
       if (immediate || needPermission) {
-        await escalateToThread(entry, toolUseId, ctx, provider);
+        await escalateToThread(entry, toolUseId, ctx, provider, pm.toolInput);
       } else {
         // Short window for fast results — escalate to thread if no result arrives
         const timer = setTimeout(async () => {
           this.pendingTimers.delete(timer);
           if (ctx.resolvedToolUseIds.has(toolUseId)) return;
-          await escalateToThread(entry, toolUseId, ctx, provider);
+          await escalateToThread(entry, toolUseId, ctx, provider, pm.toolInput);
         }, FAST_RESULT_WINDOW);
         this.pendingTimers.add(timer);
       }

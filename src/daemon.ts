@@ -18,6 +18,7 @@ import { toolState } from "./handlers/tool-state.js";
 import { renderPermissionPrompt } from "./handlers/tool-use.js";
 import { closePassiveGroup } from "./handlers/passive-tools.js";
 import { closeAllMcpGroups } from "./handlers/mcp-tools.js";
+import { startSubagentWatcher, flushAndStopSubagentWatcher, stopAllSubagentWatchersForSession } from "./subagent-watcher.js";
 import { ActivityManager } from "./activity.js";
 import { setupSlashCommands } from "./slash-commands.js";
 import { ensureHooksInstalled } from "./install-hooks.js";
@@ -771,12 +772,120 @@ function wireDiscordInput(session: Session) {
       activity.busy = true;
       activity.resetIdleTimer();
       ctx.originMessages.add(finalText);
-      write({ type: "pty-write", text: finalText });
+      // Image-path pastes need a different flow than regular text. Two
+      // upstream details bite us:
+      //   1. usePasteHandler runs onImagePaste THEN onPaste(nonImageLines)
+      //      back-to-back inside the same Promise.then() callback. Both
+      //      call insertTextAtCursor, which captures `input`/`cursorOffset`
+      //      from a closure that hasn't been re-rendered yet — so the text
+      //      paste overwrites the [Image #N] placeholder the image paste
+      //      just inserted.
+      //   2. handlePromptSubmit drops images whose [Image #N] ref is NOT
+      //      in the input text (handlePromptSubmit.ts:172). With (1)
+      //      clobbering the ref, the image is orphaned and pruned.
+      // Fix: send caption and image path as TWO separate bracketed pastes
+      // with a delay between, so React commits the caption first and the
+      // image-paste flow runs cleanly with no text-paste in the same turn.
+      // Daemon hot-reload picks this up — no rc.ts restart needed.
+      const hasImage = !!attachments?.length;
+      const imagePathRegex = /\.(png|jpe?g|gif|webp)$/i;
+      if (hasImage) {
+        // Split finalText back into caption + paths. Each non-image line is
+        // caption; every line that ends with a recognized image extension is
+        // a path. (Daemon constructed this string a few lines up; round-trip
+        // is reliable.)
+        const lines = finalText.split("\n");
+        const captionLines: string[] = [];
+        const pathLines: string[] = [];
+        for (const line of lines) {
+          if (imagePathRegex.test(line.trim())) pathLines.push(line);
+          else if (line.trim()) captionLines.push(line);
+        }
+        const caption = captionLines.join("\n");
+        const pathBlock = pathLines.join("\n");
+
+        // Step 1: caption text. Bracketed paste keeps it from auto-submitting.
+        if (caption) {
+          write({ type: "pty-write", text: `\x1b[200~${caption}\x1b[201~`, raw: true });
+        }
+        // Step 2: image path(s) as a SEPARATE bracketed paste, ~600ms later
+        // so React has committed the caption's input state.
+        const pathDelay = caption ? 600 : 0;
+        setTimeout(() => {
+          write({ type: "pty-write", text: `\x1b[200~${pathBlock}\x1b[201~`, raw: true });
+        }, pathDelay);
+        // Step 3: submit. 12s/20s after pasting gives Sharp plenty of headroom
+        // for cold-start; second \r is a no-op safety retry on empty input.
+        setTimeout(() => write({ type: "pty-write", text: "\r", raw: true }), pathDelay + 12000);
+        setTimeout(() => write({ type: "pty-write", text: "\r", raw: true }), pathDelay + 20000);
+      } else {
+        write({ type: "pty-write", text: finalText });
+      }
       activity.update("thinking", discordClient!);
     });
 
     provider.onInteraction((interaction) => {
       const id = interaction.customId;
+
+      if (id.startsWith(ID_PREFIX.EDIT_ALLOW)) {
+        const toolUseId = id.slice(ID_PREFIX.EDIT_ALLOW.length);
+        const original = pendingPermissionToolInput(toolUseId);
+        if (!original) {
+          // Hook isn't in flight — we have no channel to deliver updatedInput.
+          // Nudge the user toward the plain Allow button instead of opening a
+          // dead-end modal.
+          provider.respond(interaction, { text: "⚠️ Permission timed out — use Allow/Deny" });
+          return;
+        }
+        const ref = interaction.ref as MessageComponentInteraction;
+        const json = JSON.stringify(original, null, 2);
+        const modal = new ModalBuilder()
+          .setCustomId(`${ID_PREFIX.MODAL}${id}`)
+          .setTitle("Edit tool input");
+        const textInput = new TextInputBuilder()
+          .setCustomId("text")
+          .setLabel("Tool input (JSON)")
+          .setStyle(TextInputStyle.Paragraph)
+          .setRequired(true)
+          .setValue(json.slice(0, 4000));
+        modal.addComponents(new ActionRowBuilder<TextInputBuilder>().addComponents(textInput));
+        ref.showModal(modal).catch(() => {});
+        return;
+      }
+
+      if (id.startsWith(ID_PREFIX.ALLOW_ALWAYS)) {
+        const toolUseId = id.slice(ID_PREFIX.ALLOW_ALWAYS.length);
+        ctx.resolvedToolUseIds.add(toolUseId);
+        // Build a session-scoped addRules update so Claude won't ask again for
+        // this tool name within the current session. We deliberately skip
+        // ruleContent (which would scope to a Bash command prefix or URL) —
+        // the Discord click is a coarse "trust this tool", and a more refined
+        // rule belongs in /permissions. `session` matches upstream's default
+        // for non-Bash dialogs (FilePermissionDialog, plan, ExitPlanMode etc.)
+        // — it does NOT write to ~/.claude/settings.json.
+        const toolName = pendingPermissionToolName(toolUseId);
+        const resolved = toolName
+          ? resolvePermissionViaHook(toolUseId, {
+              behavior: "allow",
+              updatedPermissions: [{
+                type: "addRules",
+                rules: [{ toolName }],
+                behavior: "allow",
+                destination: "session",
+              }],
+            })
+          : false;
+        if (!resolved) {
+          // Hook isn't in flight — degrade to a one-time Allow rather than
+          // risk arrow-down+Enter landing on the wrong index when the dialog
+          // doesn't show always-allow options for this tool.
+          sendKeySequence(session, [ENTER]);
+        }
+        provider.respond(interaction, {
+          text: toolName && resolved ? `✅ Always allowed ${toolName} (this session)` : "✅ Allowed",
+        });
+        return;
+      }
 
       if (id.startsWith(ID_PREFIX.ALLOW)) {
         const toolUseId = id.slice(ID_PREFIX.ALLOW.length);
@@ -937,6 +1046,44 @@ function wireDiscordInput(session: Session) {
             item.text = interaction.text;
             provider.respond(interaction, { text: `✏️ Queue #${queueId} updated` });
           }
+          return;
+        }
+
+        if (id.includes(ID_PREFIX.EDIT_ALLOW)) {
+          // customId is `modal:edit-allow:<toolUseId>` — strip both prefixes.
+          const after = id.startsWith(ID_PREFIX.MODAL) ? id.slice(ID_PREFIX.MODAL.length) : id;
+          const toolUseId = after.slice(ID_PREFIX.EDIT_ALLOW.length);
+          const text = interaction.text?.trim();
+          if (!text) {
+            provider.respond(interaction, { text: "⚠️ Empty input — use Deny if you don't want to allow" });
+            return;
+          }
+          let parsed: Record<string, unknown>;
+          try {
+            const obj = JSON.parse(text);
+            if (!obj || typeof obj !== "object" || Array.isArray(obj)) {
+              throw new Error("not an object");
+            }
+            parsed = obj as Record<string, unknown>;
+          } catch (err) {
+            provider.respond(interaction, {
+              text: `❌ Invalid JSON: ${err instanceof Error ? err.message : "parse failed"}`,
+            });
+            return;
+          }
+          ctx.resolvedToolUseIds.add(toolUseId);
+          const resolved = resolvePermissionViaHook(toolUseId, {
+            behavior: "allow",
+            updatedInput: parsed,
+          });
+          if (!resolved) {
+            // Hook expired between modal-show and submit — can't deliver
+            // updatedInput via keyboard fallback. Surface the failure rather
+            // than silently allowing the original input.
+            provider.respond(interaction, { text: "⚠️ Permission expired before submit — try again" });
+            return;
+          }
+          provider.respond(interaction, { text: "✅ Allowed with edited input" });
           return;
         }
 
@@ -1151,6 +1298,7 @@ async function cleanupSession(sessionKey: string) {
   session.activity.destroy();
   session.pipeline.destroy();
   if (session.watcher) await session.watcher.close();
+  await stopAllSubagentWatchersForSession(sessionKey);
 
   for (const f of session.tempFiles) safeUnlink(f);
 
@@ -1316,6 +1464,16 @@ async function handleStateSignal(session: Session, msg: Extract<ClientToDaemon, 
       // (parent_tool_use_id missing) — JSONL-driven render still works.
       if (msg.agentId && msg.parentToolUseId) {
         subagentParents.set(msg.agentId, msg.parentToolUseId);
+        // Tail the subagent's own transcript so the parent Task's thread
+        // shows live progress instead of just start/end markers.
+        startSubagentWatcher({
+          parentSessionId: session.sessionId,
+          projectDir: session.projectDir,
+          agentId: msg.agentId,
+          parentToolUseId: msg.parentToolUseId,
+          sessionKey: session.sessionKey,
+          provider: ctx.provider,
+        });
       }
       break;
     }
@@ -1324,7 +1482,11 @@ async function handleStateSignal(session: Session, msg: Extract<ClientToDaemon, 
       const isError = msg.event === "subagent-failure";
       const parentId = msg.parentToolUseId
         || (msg.agentId ? subagentParents.get(msg.agentId) : undefined);
-      if (msg.agentId) subagentParents.delete(msg.agentId);
+      if (msg.agentId) {
+        subagentParents.delete(msg.agentId);
+        // Flush the final assistant turn, then close the watcher.
+        await flushAndStopSubagentWatcher(msg.agentId, ctx.provider);
+      }
       if (!parentId) break;
 
       const parentEntry = toolState.toolUseThreads.get(parentId);
@@ -1377,6 +1539,9 @@ async function handleClientMessage(msg: ClientToDaemon, socket: net.Socket) {
 interface PendingPermission {
   socket: net.Socket;
   timer: ReturnType<typeof setTimeout>;
+  toolName: string;
+  /** Original tool input — pre-fills the "Edit & Allow" modal. */
+  toolInput?: Record<string, unknown>;
 }
 const pendingPermissions = new Map<string, PendingPermission>();
 const HOOK_RESPONSE_WINDOW_MS = 4 * 60 * 1000;
@@ -1412,7 +1577,7 @@ function handlePermissionRequest(
     pendingPermissions.delete(msg.toolUseId);
     writeBack({ behavior: "passthrough" });
   }, HOOK_RESPONSE_WINDOW_MS);
-  pendingPermissions.set(msg.toolUseId, { socket, timer });
+  pendingPermissions.set(msg.toolUseId, { socket, timer, toolName: msg.toolName, toolInput: msg.toolInput });
 
   // Render Allow/Deny in Discord. The hook firing is the authoritative signal
   // that Claude actually wants permission — independent of permissionMode, so
@@ -1422,7 +1587,7 @@ function handlePermissionRequest(
   const entry = toolState.toolUseThreads.get(msg.toolUseId);
   const provider = session.ctx.provider;
   if (entry?.thread && hasThreads(provider)) {
-    renderPermissionPrompt(entry, msg.toolUseId, provider).catch((err) => {
+    renderPermissionPrompt(entry, msg.toolUseId, provider, msg.toolInput).catch((err) => {
       console.error("[daemon] Failed to render permission prompt:", err);
     });
   } else {
@@ -1434,9 +1599,18 @@ function handlePermissionRequest(
  * Returns true if a pending hook responder claimed the click — caller should
  * skip the legacy keyboard-simulation fallback.
  */
+type PermissionUpdate = {
+  type: "addRules" | "replaceRules" | "removeRules";
+  rules: Array<{ toolName: string; ruleContent?: string }>;
+  behavior: "allow" | "deny" | "ask";
+  destination: "userSettings" | "projectSettings" | "localSettings" | "session" | "cliArg";
+};
+
 function resolvePermissionViaHook(
   toolUseId: string,
-  decision: { behavior: "allow"; updatedInput?: Record<string, unknown> } | { behavior: "deny"; message?: string },
+  decision:
+    | { behavior: "allow"; updatedInput?: Record<string, unknown>; updatedPermissions?: PermissionUpdate[] }
+    | { behavior: "deny"; message?: string },
 ): boolean {
   const pending = pendingPermissions.get(toolUseId);
   if (!pending) return false;
@@ -1448,6 +1622,20 @@ function resolvePermissionViaHook(
     pending.socket.end();
   } catch { /* socket gone — keyboard sim would have been a no-op too */ }
   return true;
+}
+
+/** Look up the tool name for a still-pending permission click — used by the
+ *  Always-Allow handler to build an addRules update. Returns null if the hook
+ *  isn't in flight (older Claude / hook lost the race). */
+function pendingPermissionToolName(toolUseId: string): string | null {
+  return pendingPermissions.get(toolUseId)?.toolName ?? null;
+}
+
+/** Look up the original tool input for "Edit & Allow" modal pre-fill. Returns
+ *  null when the hook isn't in flight, in which case the modal can't be shown
+ *  (no channel to deliver updatedInput through). */
+function pendingPermissionToolInput(toolUseId: string): Record<string, unknown> | null {
+  return pendingPermissions.get(toolUseId)?.toolInput ?? null;
 }
 
 // ── Main startup ──
