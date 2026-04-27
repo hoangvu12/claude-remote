@@ -238,7 +238,17 @@ function handleDaemonMessage(msg: DaemonToClient) {
       setTimeout(() => proc?.write("\r"), firstEnter);
       setTimeout(() => proc?.write("\r"), secondEnter);
     } else {
-      proc?.write(msg.text + "\r");
+      // Short single-line text. Even though we don't wrap in bracketed
+      // paste markers, ConPTY on Windows can fragment a single PTY write
+      // into multiple input events arriving < 100ms apart. When that
+      // happens Claude's usePasteHandler still batches the burst as a
+      // paste and the trailing \r becomes a literal newline — the user
+      // sees their text + a blank line and no submit. Defer the Enter
+      // past the 100ms debounce window so it's never absorbed into the
+      // burst, with a safety retry like the paste branch.
+      proc?.write(msg.text);
+      setTimeout(() => proc?.write("\r"), 250);
+      setTimeout(() => proc?.write("\r"), 600);
     }
   } else if (msg.type === "daemon-ready") {
     lastChannelId = msg.channelId;
