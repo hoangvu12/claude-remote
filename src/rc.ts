@@ -31,6 +31,7 @@ let daemonWasEnabled = false;
 let lastChannelId: string | null = null;
 let connecting = false;
 let restarting = false;
+let resumeSessionId: string | null = null;
 let proc: IPty | null = null;
 let sessionSource: "startup" | "resume" | "clear" | "compact" | undefined;
 
@@ -55,8 +56,27 @@ function setupTerminalInput() {
 
 process.env.CLAUDE_REMOTE_PIPE = HOOK_PIPE_NAME;
 
-function spawnClaude(): IPty {
-  const p = pty.spawn(CLAUDE_BIN, claudeArgs, {
+function stripResumeArgs(args: string[]): string[] {
+  const out: string[] = [];
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (a === "-c" || a === "--continue") continue;
+    if (a === "-r" || a === "--resume") {
+      // --resume's value is optional; only consume the next token if it
+      // doesn't look like another flag.
+      if (i + 1 < args.length && !args[i + 1].startsWith("-")) i++;
+      continue;
+    }
+    out.push(a);
+  }
+  return out;
+}
+
+function spawnClaude(resumeFrom?: string | null): IPty {
+  const args = resumeFrom
+    ? [...stripResumeArgs(claudeArgs), "--resume", resumeFrom]
+    : claudeArgs;
+  const p = pty.spawn(CLAUDE_BIN, args, {
     name: "xterm-color",
     cols: process.stdout.columns || 120,
     rows: process.stdout.rows || 30,
@@ -71,10 +91,19 @@ function spawnClaude(): IPty {
   p.onExit(({ exitCode }) => {
     if (restarting) {
       restarting = false;
-      sessionId = null;
-      transcriptPath = null;
-      console.log("[rc] Restarting Claude...");
-      proc = spawnClaude();
+      const resume = resumeSessionId;
+      resumeSessionId = null;
+      // Keep sessionId/transcriptPath set so the same daemon session keeps
+      // its watcher on the existing JSONL — with --resume Claude appends
+      // to the same file and re-emits session-register with the same id.
+      if (resume) {
+        console.log(`[rc] Restarting Claude (resuming ${resume.slice(0, 8)})...`);
+      } else {
+        sessionId = null;
+        transcriptPath = null;
+        console.log("[rc] Restarting Claude...");
+      }
+      proc = spawnClaude(resume);
       return;
     }
     restoreTerminal();
@@ -261,6 +290,9 @@ function handleDaemonMessage(msg: DaemonToClient) {
 function restartClaude() {
   if (restarting || !proc) return;
   restarting = true;
+  // Capture the current session id so onExit can respawn with --resume and
+  // continue the same conversation instead of starting a fresh one.
+  resumeSessionId = sessionId;
   // Claude Code's useExitOnCtrlCD wants two presses of the SAME key within a
   // ~2s window. Mixing Ctrl+C and Ctrl+D resets each other's pending state and
   // never confirms. Cancel any in-flight work with Escape first, then double

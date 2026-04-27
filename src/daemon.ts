@@ -296,9 +296,18 @@ async function _flushBatch(session: Session) {
 // ── JSONL File watcher (per-session) ──
 
 function startWatcher(session: Session) {
+  // Claude Code drains JSONL writes every ~100ms during a live turn (and 10ms
+  // when remote ingress is on). With awaitWriteFinish.stabilityThreshold>=100
+  // chokidar would keep deferring the `change` event until the assistant goes
+  // idle, so messages stop reaching Discord mid-turn. We don't need stability
+  // protection here — handleFileChange already guards against partial lines
+  // by trimming to the last \n before parsing — so disable awaitWriteFinish
+  // and use a low-latency poll on Windows where ReadDirectoryChangesW can
+  // miss appends to a single file.
   session.watcher = chokidar.watch(session.jsonlPath, {
     persistent: true,
-    awaitWriteFinish: { stabilityThreshold: 200, pollInterval: 50 },
+    usePolling: process.platform === "win32",
+    interval: 100,
   });
   session.watcher.on("change", (p) => handleFileChange(session, p));
   session.watcher.on("error", (err: unknown) => console.error("[daemon] Watcher error:", err));

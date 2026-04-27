@@ -1,6 +1,6 @@
 {
   "name": "@hoangvu12/claude-remote",
-  "version": "1.8.0",
+  "version": "1.8.1",
   "description": "Remote Control for Claude Code - monitor and interact with Claude Code sessions from your phone",
   "type": "module",
   "bin": {
