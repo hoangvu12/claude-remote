@@ -180,6 +180,7 @@ export type StateSignalEvent =
   | "tool-start"
   | "tool-end"
   | "tool-failure"
+  | "user-prompt-submit"
   | "subagent-start"
   | "subagent-end"
   | "subagent-failure";

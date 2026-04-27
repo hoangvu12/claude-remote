@@ -3,6 +3,10 @@
 /**
  * Claude Code lifecycle hook — forwards deterministic state signals to rc.ts.
  * Registered against these hook events in settings.json:
+ *   - UserPromptSubmit → `user-prompt-submit` (turn entered dispatching/running —
+ *                        earliest TUI signal; upstream has no SessionState
+ *                        equivalent in TUI mode, so this is the canonical
+ *                        "Claude is now generating" trigger before any API call)
  *   - Stop           → `stop`             (turn end; replaces idle-heuristic)
  *   - StopFailure    → `stop-failure`     (turn ended due to API error)
  *   - PostCompact    → `post-compact`     (context just got truncated)
@@ -13,6 +17,13 @@
  *   - SubagentStop   → `subagent-end`     (subagent finished, includes duration)
  *
  * Only activates when CLAUDE_REMOTE_PIPE is set (by rc.ts).
+ *
+ * UserPromptSubmit handling: state-hook runs in parallel with remote-hook
+ * (both subscribe to UserPromptSubmit). State-hook intentionally skips
+ * /remote prompts because remote-hook returns {decision:"block"} for them
+ * — they never start a turn, so flipping busy=true would leave us
+ * permanently busy until the 90s idle fallback. Other slash commands
+ * (/clear, /compact, /model) DO run a turn, so they pass through.
  */
 
 import { sendPipeMessage } from "./pipe-client.js";
@@ -20,6 +31,8 @@ import type { StateSignalEvent } from "./types.js";
 
 interface HookPayload {
   hook_event_name?: string;
+  // UserPromptSubmit
+  prompt?: string;
   // Stop
   stop_hook_active?: boolean;
   last_assistant_message?: string;
@@ -75,6 +88,15 @@ async function main() {
 
   let mapped: StateSignalEvent | null = null;
   switch (event) {
+    case "UserPromptSubmit": {
+      // /remote prompts get blocked by remote-hook and never start a turn.
+      // Forwarding "user-prompt-submit" for them would leave us busy until
+      // the 90s fallback fires.
+      const trimmed = (payload.prompt || "").trim().toLowerCase();
+      if (trimmed.startsWith("/remote")) process.exit(0);
+      mapped = "user-prompt-submit";
+      break;
+    }
     case "Stop":
       mapped = "stop";
       break;

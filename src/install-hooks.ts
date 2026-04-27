@@ -56,6 +56,11 @@ export interface ExpectedHook {
  */
 export const EXPECTED_HOOKS: ExpectedHook[] = [
   { event: "UserPromptSubmit", script: "remote-hook", timeoutMs: 5_000 },
+  // Second UserPromptSubmit hook — runs in parallel with remote-hook to
+  // forward a "user-prompt-submit" state-signal. This is the earliest TUI
+  // signal that a turn has started (upstream's notifySessionStateChanged
+  // chokepoint is gated on non-interactive mode and never fires in TUI).
+  { event: "UserPromptSubmit", script: "state-hook", timeoutMs: 5_000 },
   { event: "SessionStart", script: "session-hook", timeoutMs: 5_000 },
   { event: "SessionEnd", script: "state-hook", timeoutMs: 5_000 },
   { event: "Stop", script: "state-hook", timeoutMs: 5_000 },

@@ -13,13 +13,18 @@ export interface QueuedMessage {
 }
 
 /**
- * Fallback idle timer — normally the Stop hook (state-hook.ts) fires
- * deterministically at turn end and calls transitionToIdle. This timer only
- * matters when the hook doesn't fire (plain `claude` without claude-remote
- * hooks installed, or hook failure). Generous to avoid false-positive idle
- * transitions during long tool runs.
+ * Fallback idle timer — covers the cases Stop/StopFailure don't fire:
+ *   - Esc-aborted turns (aborted_streaming, aborted_tools) — query.ts:1051,1515
+ *   - max_turns / prompt_too_long / hook_stopped — query.ts:1711, no Stop path
+ *   - refusal / model_error — short-circuits before handleStopHooks
+ *
+ * Reset on any activity-bearing signal (UserPromptSubmit, tool-start,
+ * tool-end, tool-failure, JSONL write). 90s is long enough to outlast a
+ * real tool run that's quietly streaming output but short enough that an
+ * Esc-cancelled turn doesn't leave the queue stuck for 10 minutes (the
+ * old value was effectively "never").
  */
-const IDLE_TIMEOUT = 10 * 60_000;
+const IDLE_TIMEOUT = 90_000;
 
 const PRESENCE_LABELS: Record<ActivityState, string> = {
   idle: "Waiting for input",
@@ -95,7 +100,7 @@ export class ActivityManager {
     if (!this.busy) return;
     this.idleTimer = setTimeout(() => {
       if (!this.busy) return;
-      console.log("[activity] Idle timeout — no JSONL activity for 2m, assuming idle");
+      console.log("[activity] Idle timeout — no activity for 90s, assuming idle (likely Esc-aborted turn or hook miss)");
       this.transitionToIdle(0);
     }, IDLE_TIMEOUT);
   }

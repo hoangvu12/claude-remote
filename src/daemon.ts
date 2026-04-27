@@ -1352,6 +1352,20 @@ function handleConnection(socket: net.Socket) {
 async function handleStateSignal(session: Session, msg: Extract<ClientToDaemon, { type: "state-signal" }>) {
   const { activity, ctx } = session;
   switch (msg.event) {
+    case "user-prompt-submit": {
+      // Earliest possible TUI signal that a turn has begun — fires from
+      // processUserInput.ts after queryGuard.reserve() but BEFORE tryStart()
+      // (i.e. inside upstream's "dispatching" sub-state, before any API call).
+      // Catches direct-terminal typing, queue drains, slash commands, and SDK
+      // submits. state-hook filters out /remote prompts (which never start a
+      // turn) and subagent-originated submits (agent_id set).
+      if (!activity.busy) {
+        activity.busy = true;
+        if (activity.state === "idle") activity.update("thinking");
+      }
+      activity.resetIdleTimer();
+      break;
+    }
     case "stop":
       // Turn finished. If the hook payload carries a closing message we could
       // surface it, but the transcript already has the assistant text — so the
