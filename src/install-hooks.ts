@@ -32,6 +32,8 @@ export const HOOK_EVENT_TYPES = [
   "PostToolUseFailure",
   "SubagentStart",
   "SubagentStop",
+  "Elicitation",
+  "ElicitationResult",
 ];
 
 /** Substrings used to identify hook entries that belong to claude-remote. */
@@ -42,6 +44,7 @@ export const HOOK_SCRIPT_NAMES = [
   "state-hook",
   "permission-hook",
   "tool-hook",
+  "elicitation-hook",
 ];
 
 export interface ExpectedHook {
@@ -81,6 +84,12 @@ export const EXPECTED_HOOKS: ExpectedHook[] = [
   // filter is only for the main-thread Stop/Start variants).
   { event: "SubagentStart", script: "state-hook", timeoutMs: 5_000 },
   { event: "SubagentStop", script: "state-hook", timeoutMs: 5_000 },
+  // 5min — elicitation-hook blocks until the user submits a Discord modal.
+  // Mirrors permission-hook's shape (4min internal timeout, passthrough on
+  // miss). ElicitationResult is observability-only — same script, returns
+  // passthrough immediately so it doesn't override the user's response.
+  { event: "Elicitation", script: "elicitation-hook", timeoutMs: 5 * 60 * 1000 },
+  { event: "ElicitationResult", script: "elicitation-hook", timeoutMs: 5_000 },
 ];
 
 export function getClaudeSettingsPath(): string {

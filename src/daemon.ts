@@ -22,6 +22,7 @@ import { startSubagentWatcher, flushAndStopSubagentWatcher, stopAllSubagentWatch
 import { ActivityManager } from "./activity.js";
 import { setupSlashCommands } from "./slash-commands.js";
 import { ensureHooksInstalled } from "./install-hooks.js";
+import { calculateUSDCost, formatTokens, formatUSD, renderContextBar, DEFAULT_CONTEXT_WINDOW } from "./cost.js";
 
 // ── Constants ──
 
@@ -83,6 +84,22 @@ interface Session {
   lastBashOutput: Map<string, string>;
   tempFiles: Set<string>;
   slashCleanup: (() => void) | null;
+  /** Timestamp of last post-compact hook firing — JSONL compact_boundary uses
+   *  this to skip its plain marker when the hook will follow with a summary. */
+  postCompactSeen: number | null;
+  /** Cumulative usage tallied from JSONL `assistant.message.usage`, summed
+   *  across all assistant turns since session start. Drives the Stop footer
+   *  (cost + token totals + context %). */
+  totalUsage: { input: number; output: number; cacheRead: number; cacheCreate: number; cost: number };
+  /** Last assistant input_tokens — represents the total context size at that
+   *  turn (input includes full history). Used for the context % bar. */
+  lastInputTokens: number;
+  /** Discord user_id of the first human to send a message in this channel.
+   *  Used as the @mention target for idle_prompt notifications. */
+  initiatorUserId: string | null;
+  /** Last seen model id — falls back to default for cost computation when
+   *  JSONL doesn't tag a turn. */
+  lastModel: string | null;
 }
 
 // ── Daemon-level state ──
@@ -358,6 +375,22 @@ async function handleFileChange(session: Session, filePath: string) {
         continue;
       }
 
+      // Accumulate per-turn usage so the Stop-event handler can render a
+      // cost + token + context-% footer. `input_tokens` on the latest turn
+      // doubles as the current context size (input includes full history).
+      if (msg.type === "assistant" && msg.message?.usage) {
+        const u = msg.message.usage;
+        const model = msg.message.model;
+        if (model && model !== "<synthetic>") session.lastModel = model;
+        const cost = calculateUSDCost(session.lastModel, u);
+        session.totalUsage.input += u.input_tokens ?? 0;
+        session.totalUsage.output += u.output_tokens ?? 0;
+        session.totalUsage.cacheRead += u.cache_read_input_tokens ?? 0;
+        session.totalUsage.cacheCreate += u.cache_creation_input_tokens ?? 0;
+        session.totalUsage.cost += cost;
+        if (u.input_tokens != null) session.lastInputTokens = u.input_tokens;
+      }
+
       if (msg.type === "user" && msg.message && Array.isArray(msg.message.content)) {
         const isInterrupt = (msg.message.content as ContentBlock[]).some(
           (b) => b.type === "text" && (b as ContentBlockText).text.startsWith("[Request interrupted by user"),
@@ -419,7 +452,14 @@ async function handleFileChange(session: Session, filePath: string) {
           });
           if (activity) activity.transitionToIdle();
         } else if (msg.subtype === "compact_boundary") {
-          await ctx.provider.send({ text: "🗜️ **Context compacted**" });
+          // PostCompact hook now owns the rendering (with summary text). If
+          // it fired in the last 30s, skip the JSONL marker to avoid double-
+          // posting. Older transcripts (pre-hook) still get the fallback.
+          const recent = session.postCompactSeen != null
+            && Date.now() - session.postCompactSeen < 30_000;
+          if (!recent) {
+            await ctx.provider.send({ text: "🗜️ **Context compacted**" });
+          }
         }
         session.knownUuids.add(msg.uuid);
         session.lastMessageUuid = msg.uuid;
@@ -719,8 +759,12 @@ function wireDiscordInput(session: Session) {
   const write = makePtyWriter(session);
 
   if (hasInput(provider)) {
-    provider.onUserMessage(async (text, attachments) => {
+    provider.onUserMessage(async (text, attachments, userId) => {
       console.log(`[daemon] Discord input [${session.sessionKey}]: ${text}${attachments ? ` (+${attachments.length} images)` : ""}`);
+      // Latch the first human user — they become the @mention target for
+      // idle_prompt notifications. Sticky for the session so it doesn't drift
+      // when teammates chime in mid-conversation.
+      if (!session.initiatorUserId && userId) session.initiatorUserId = userId;
 
       let finalText = text;
       if (attachments?.length) {
@@ -760,6 +804,21 @@ function wireDiscordInput(session: Session) {
       }
 
       if (!finalText) return;
+
+      // Intercept exit aliases — upstream handlePromptSubmit treats these as
+      // session terminators (utils/handlePromptSubmit.ts:196). Forwarding the
+      // bare word would kill the Claude process behind the bridge with no
+      // chance to reconnect. Surface a confirm button instead.
+      const trimmed = finalText.trim().toLowerCase();
+      if (trimmed === "exit" || trimmed === "quit" || trimmed === ":q" || trimmed === ":wq" || trimmed === ":q!") {
+        await provider.send({
+          embed: {
+            description: "⚠️ **Exit blocked** — typing `exit`/`quit`/`:q` would kill the Claude session. Use `/restart` to start fresh, or just type your next prompt.",
+            color: 0xf5a623,
+          },
+        });
+        return;
+      }
 
       if (activity.busy) {
         const msg = activity.enqueue(finalText);
@@ -914,6 +973,44 @@ function wireDiscordInput(session: Session) {
           sendKeySequence(session, [ESCAPE]);
         }
         provider.respond(interaction, { text: "❌ Denied" });
+        return;
+      }
+
+      if (id.startsWith(ID_PREFIX.ELICIT_ACCEPT)) {
+        const elicitId = id.slice(ID_PREFIX.ELICIT_ACCEPT.length);
+        const ref = interaction.ref as MessageComponentInteraction;
+        const modal = new ModalBuilder()
+          .setCustomId(`${ID_PREFIX.MODAL}${id}`)
+          .setTitle("MCP form input");
+        const textInput = new TextInputBuilder()
+          .setCustomId("text")
+          .setLabel("Response (JSON)")
+          .setStyle(TextInputStyle.Paragraph)
+          .setRequired(true)
+          .setPlaceholder('{"field": "value"}')
+          .setValue("{}");
+        modal.addComponents(new ActionRowBuilder<TextInputBuilder>().addComponents(textInput));
+        ref.showModal(modal).catch(() => {});
+        // mark id as referenced so eslint isn't unhappy
+        void elicitId;
+        return;
+      }
+
+      if (id.startsWith(ID_PREFIX.ELICIT_DECLINE)) {
+        const elicitId = id.slice(ID_PREFIX.ELICIT_DECLINE.length);
+        const resolved = resolveElicitationViaHook(elicitId, { action: "decline" });
+        provider.respond(interaction, {
+          text: resolved ? "❌ Declined" : "⚠️ Elicitation timed out",
+        });
+        return;
+      }
+
+      if (id.startsWith(ID_PREFIX.ELICIT_CANCEL)) {
+        const elicitId = id.slice(ID_PREFIX.ELICIT_CANCEL.length);
+        const resolved = resolveElicitationViaHook(elicitId, { action: "cancel" });
+        provider.respond(interaction, {
+          text: resolved ? "🚫 Cancelled" : "⚠️ Elicitation timed out",
+        });
         return;
       }
 
@@ -1087,6 +1184,33 @@ function wireDiscordInput(session: Session) {
           return;
         }
 
+        if (id.includes(ID_PREFIX.ELICIT_ACCEPT)) {
+          // customId is `modal:elicit-accept:<id>` — strip both prefixes.
+          const after = id.startsWith(ID_PREFIX.MODAL) ? id.slice(ID_PREFIX.MODAL.length) : id;
+          const elicitId = after.slice(ID_PREFIX.ELICIT_ACCEPT.length);
+          const text = interaction.text?.trim();
+          if (!text) {
+            provider.respond(interaction, { text: "⚠️ Empty response — use Decline if you don't want to fill it in" });
+            return;
+          }
+          let parsed: Record<string, unknown>;
+          try {
+            const obj = JSON.parse(text);
+            if (!obj || typeof obj !== "object" || Array.isArray(obj)) throw new Error("not an object");
+            parsed = obj as Record<string, unknown>;
+          } catch (err) {
+            provider.respond(interaction, {
+              text: `❌ Invalid JSON: ${err instanceof Error ? err.message : "parse failed"}`,
+            });
+            return;
+          }
+          const resolved = resolveElicitationViaHook(elicitId, { action: "accept", content: parsed });
+          provider.respond(interaction, {
+            text: resolved ? "✅ Submitted" : "⚠️ Elicitation expired before submit",
+          });
+          return;
+        }
+
         if (id.includes(ID_PREFIX.PLAN_FEEDBACK)) {
           const feedback = interaction.text?.trim();
           if (feedback) {
@@ -1238,6 +1362,11 @@ async function createSession(msg: ClientToDaemon & { type: "session-info" }, soc
     askStates: new Map(), askOptionCounts: new Map(),
     lastBashOutput: new Map(), tempFiles: new Set(),
     slashCleanup: null,
+    postCompactSeen: null,
+    totalUsage: { input: 0, output: 0, cacheRead: 0, cacheCreate: 0, cost: 0 },
+    lastInputTokens: 0,
+    initiatorUserId: null,
+    lastModel: null,
   };
 
   sessions.set(sessionKey, session);
@@ -1336,6 +1465,12 @@ function handleConnection(socket: net.Socket) {
         pendingPermissions.delete(toolUseId);
       }
     }
+    for (const [eid, pending] of pendingElicitations) {
+      if (pending.socket === socket) {
+        clearTimeout(pending.timer);
+        pendingElicitations.delete(eid);
+      }
+    }
     if (connSessionKey) {
       const session = sessions.get(connSessionKey);
       if (session && session.socket === socket) {
@@ -1366,12 +1501,44 @@ async function handleStateSignal(session: Session, msg: Extract<ClientToDaemon, 
       activity.resetIdleTimer();
       break;
     }
-    case "stop":
-      // Turn finished. If the hook payload carries a closing message we could
-      // surface it, but the transcript already has the assistant text — so the
-      // signal is purely a state transition.
+    case "stop": {
+      // Turn finished. The transcript already has the assistant text; the
+      // hook's last_assistant_message is a convenience for surfacing a clean
+      // "✓ done" line on mobile without scrolling. Append a cost + context %
+      // footer line so users can see token spend + capacity at a glance
+      // without typing /cost or /context.
+      const last = msg.lastAssistantMessage?.trim();
+      const u = session.totalUsage;
+      const haveUsage = u.input > 0 || u.output > 0;
+      let body = "";
+      if (last && last.length > 0) body += `✓ ${truncate(last, 200)}\n`;
+      if (haveUsage) {
+        const cacheTotal = u.cacheRead + u.cacheCreate;
+        const cachePct = cacheTotal + u.input > 0
+          ? Math.round((u.cacheRead / (cacheTotal + u.input)) * 100)
+          : 0;
+        const ctxPct = (session.lastInputTokens / DEFAULT_CONTEXT_WINDOW) * 100;
+        const ctx = renderContextBar(ctxPct);
+        const parts = [
+          `${formatTokens(u.input)} in`,
+          `${formatTokens(u.output)} out`,
+        ];
+        if (cacheTotal > 0) parts.push(`cache ${cachePct}%`);
+        parts.push(formatUSD(u.cost));
+        parts.push(ctx.bar);
+        body += `*${parts.join(" · ")}*`;
+      }
+      if (body) {
+        await ctx.provider.send({
+          embed: {
+            description: body,
+            color: haveUsage ? renderContextBar(session.lastInputTokens / DEFAULT_CONTEXT_WINDOW * 100).color : COLOR.SYSTEM,
+          },
+        });
+      }
       activity.transitionToIdle();
       break;
+    }
     case "stop-failure": {
       // Replaces the brittle `isApiErrorMessage` JSONL field check. StopFailure
       // fires when the assistant turn ends because the API returned an error;
@@ -1394,11 +1561,23 @@ async function handleStateSignal(session: Session, msg: Extract<ClientToDaemon, 
       activity.transitionToIdle();
       break;
     }
-    case "post-compact":
+    case "post-compact": {
+      // PostCompact carries the compact summary text (state-hook forwards
+      // payload.compact_summary as `message`). Render it as a collapsed
+      // embed so users can see what was preserved across the boundary.
+      // The JSONL compact_boundary handler skips its plain marker when this
+      // hook fires (modern Claude always sends it) to avoid double-posting.
+      session.postCompactSeen = Date.now();
+      const summary = msg.message?.trim();
+      const body = summary
+        ? `🗜️ **Context compacted**\n>>> ${truncate(summary, 500)}`
+        : "🗜️ **Context compacted**";
+      await ctx.provider.send({
+        embed: { description: body, color: 0xf5a623 },
+      });
       if (msg.trigger === "manual") activity.transitionToIdle();
-      // Auto compact boundary is already rendered from the JSONL compact_boundary
-      // event; we just use the state change signal here.
       break;
+    }
     case "pre-compact": {
       const scope = msg.trigger === "manual" ? "manual" : "auto";
       const hint = msg.customInstructions ? `\n> ${truncate(msg.customInstructions, 300)}` : "";
@@ -1440,6 +1619,15 @@ async function handleStateSignal(session: Session, msg: Extract<ClientToDaemon, 
         const body = msg.message ? `: ${truncate(msg.message, 200)}` : "";
         await ctx.provider.send({
           embed: { description: `👷 **Worker permission requested**${body}`, color: 0xf5a623 },
+        });
+      } else if (nt === "idle_prompt") {
+        // Claude is idle and waiting for input — REPL.tsx ~line 3936 emits
+        // this when the user has been away for a while. Ping the session
+        // initiator so they get a phone push without scrolling Discord.
+        const mention = session.initiatorUserId ? `<@${session.initiatorUserId}> ` : "";
+        const body = msg.message ? `: ${truncate(msg.message, 200)}` : "";
+        await ctx.provider.send({
+          text: `${mention}🔔 Claude is waiting for input${body}`,
         });
       }
       // permission_prompt / elicitation_dialog are already covered by the
@@ -1538,6 +1726,8 @@ async function handleClientMessage(msg: ClientToDaemon, socket: net.Socket) {
     await cleanupSession(msg.sessionKey);
   } else if (msg.type === "permission-request") {
     handlePermissionRequest(msg, socket);
+  } else if (msg.type === "elicitation-request") {
+    handleElicitationRequest(msg, socket);
   }
 }
 
@@ -1650,6 +1840,105 @@ function pendingPermissionToolName(toolUseId: string): string | null {
  *  (no channel to deliver updatedInput through). */
 function pendingPermissionToolInput(toolUseId: string): Record<string, unknown> | null {
   return pendingPermissions.get(toolUseId)?.toolInput ?? null;
+}
+
+// ── Elicitation hook responders ──
+//
+// Same shape as PermissionRequest: hook subprocess registers, daemon shows a
+// Discord modal, user submits, daemon writes back the structured response.
+// The "form" mode shows a single textarea expecting JSON matching
+// requested_schema; "url" mode shows a button linking out (ElicitationResult
+// observability returns passthrough at the hook level).
+
+interface PendingElicitation {
+  socket: net.Socket;
+  timer: ReturnType<typeof setTimeout>;
+  mcpServerName: string;
+  message: string;
+  mode: "form" | "url";
+  url?: string;
+  requestedSchema?: Record<string, unknown>;
+}
+const pendingElicitations = new Map<string, PendingElicitation>();
+const ELICITATION_RESPONSE_WINDOW_MS = 4 * 60 * 1000;
+
+function handleElicitationRequest(
+  msg: Extract<ClientToDaemon, { type: "elicitation-request" }>,
+  socket: net.Socket,
+) {
+  const writeBack = (payload: { action: "accept" | "decline" | "cancel" | "passthrough"; content?: Record<string, unknown> }) => {
+    try { socket.write(JSON.stringify(payload) + "\n"); socket.end(); } catch { /* gone */ }
+  };
+
+  const session = [...sessions.values()].find((s) => s.sessionId === msg.sessionId);
+  if (!session) {
+    writeBack({ action: "passthrough" });
+    return;
+  }
+  // Stable id — `elicitation_id` from upstream when present, otherwise a hash
+  // of message + server. We only allow one pending elicitation per id.
+  const id = msg.elicitationId || `${msg.mcpServerName ?? "mcp"}:${(msg.message ?? "").slice(0, 32)}`;
+  const existing = pendingElicitations.get(id);
+  if (existing) {
+    clearTimeout(existing.timer);
+    try { existing.socket.write(JSON.stringify({ action: "passthrough" }) + "\n"); existing.socket.end(); } catch { /* gone */ }
+  }
+  const timer = setTimeout(() => {
+    const p = pendingElicitations.get(id);
+    if (!p || p.socket !== socket) return;
+    pendingElicitations.delete(id);
+    writeBack({ action: "passthrough" });
+  }, ELICITATION_RESPONSE_WINDOW_MS);
+  pendingElicitations.set(id, {
+    socket, timer,
+    mcpServerName: msg.mcpServerName || "mcp",
+    message: msg.message || "",
+    mode: msg.mode || "form",
+    url: msg.url,
+    requestedSchema: msg.requestedSchema,
+  });
+
+  const provider = session.ctx.provider;
+  const schemaPretty = msg.requestedSchema
+    ? `\n\`\`\`json\n${truncate(JSON.stringify(msg.requestedSchema, null, 2), 1500)}\n\`\`\``
+    : "";
+  const body = `📝 **${msg.mcpServerName ?? "MCP"} requests input**\n${truncate(msg.message ?? "", 800)}${schemaPretty}`;
+
+  if (msg.mode === "url" && msg.url) {
+    provider.send({
+      embed: { description: `${body}\n\n[Open form ↗](${msg.url})`, color: 0xf5a623 },
+      actions: [
+        { id: `${ID_PREFIX.ELICIT_DECLINE}${id}`, label: "Decline", style: "secondary" },
+        { id: `${ID_PREFIX.ELICIT_CANCEL}${id}`, label: "Cancel", style: "danger" },
+      ],
+    }).catch((err) => console.error("[daemon] Failed to render elicitation:", err));
+  } else {
+    provider.send({
+      embed: { description: body, color: 0xf5a623 },
+      actions: [
+        { id: `${ID_PREFIX.ELICIT_ACCEPT}${id}`, label: "Fill in", style: "primary" },
+        { id: `${ID_PREFIX.ELICIT_DECLINE}${id}`, label: "Decline", style: "secondary" },
+        { id: `${ID_PREFIX.ELICIT_CANCEL}${id}`, label: "Cancel", style: "danger" },
+      ],
+    }).catch((err) => console.error("[daemon] Failed to render elicitation:", err));
+  }
+}
+
+function resolveElicitationViaHook(
+  id: string,
+  decision: { action: "accept"; content?: Record<string, unknown> }
+    | { action: "decline" }
+    | { action: "cancel" },
+): boolean {
+  const pending = pendingElicitations.get(id);
+  if (!pending) return false;
+  pendingElicitations.delete(id);
+  clearTimeout(pending.timer);
+  try {
+    pending.socket.write(JSON.stringify(decision) + "\n");
+    pending.socket.end();
+  } catch { /* gone */ }
+  return true;
 }
 
 // ── Main startup ──

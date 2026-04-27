@@ -28,8 +28,19 @@ export class PassiveToolHandler implements MessageHandler {
 
   async handle(pm: ProcessedMessage, ctx: SessionContext): Promise<HandlerResult> {
     if (!isPassiveToolUse(pm)) {
-      await closePassiveGroup(ctx);
-      if (!isMcpTool(pm.toolName || "")) await closeAllMcpGroups(ctx);
+      // Keep the active group alive across passive-only messages: pure
+      // assistant text, tool-results, thinking blocks, web-search, etc. don't
+      // signify "the user is now looking at something else." Only close on
+      // a real non-passive tool-use (a state change in what Claude is doing)
+      // — this lets sequences like Read…text…Read coalesce into one
+      // "Read N files" thread instead of 2 single-file threads. Idle still
+      // closes via activity.onIdle (daemon.ts:1254) so stale groups don't
+      // linger across turns.
+      const isOtherToolUse = pm.type === "tool-use" || pm.type === "tool-use-group";
+      if (isOtherToolUse) {
+        await closePassiveGroup(ctx);
+        if (!isMcpTool(pm.toolName || "")) await closeAllMcpGroups(ctx);
+      }
       return "pass";
     }
 

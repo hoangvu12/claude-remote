@@ -49,6 +49,9 @@ export const ID_PREFIX = {
   PLAN_FEEDBACK: "plan-feedback:",
   MODE: "mode:",
   QUEUE_EDIT: "queue-edit:",
+  ELICIT_ACCEPT: "elicit-accept:",
+  ELICIT_DECLINE: "elicit-decline:",
+  ELICIT_CANCEL: "elicit-cancel:",
 } as const;
 
 // ── Helpers ──
@@ -123,10 +126,20 @@ export function mimeToExt(mediaType: string): string {
 }
 
 // ── Claude Code local-only CLI commands (don't trigger API calls) ──
+//
+// Mirrors upstream's `immediate: true` + `type: 'local-jsx'` command set in
+// src/commands/*/index.ts — these run entirely in the TUI without contacting
+// the API, so they should not flip activity to "thinking" when seen in JSONL.
 
 const LOCAL_COMMANDS = [
   "/model", "/fast", "/login", "/logout",
   "/help", "/cost", "/mcp", "/stats",
+  "/agents", "/add-dir", "/clear", "/compact", "/config", "/context",
+  "/copy", "/diff", "/doctor", "/effort", "/env", "/exit", "/export",
+  "/files", "/hooks", "/ide", "/init", "/memory", "/onboarding",
+  "/output-style", "/permissions", "/plugin", "/release-notes",
+  "/rename", "/resume", "/review", "/security-review", "/skills",
+  "/status", "/tag", "/theme", "/tasks", "/usage", "/vim",
 ];
 
 /** Check if a message is a local-only CLI command that won't trigger an API call */

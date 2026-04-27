@@ -1,4 +1,4 @@
-import type { JSONLMessage, ContentBlock, ContentBlockToolUse, ProcessedMessage } from "./types.js";
+import type { JSONLMessage, ContentBlock, ContentBlockToolUse, ContentBlockThinking, ContentBlockServerToolUse, ContentBlockWebSearchToolResult, ProcessedMessage } from "./types.js";
 import { truncate, extractToolResultText, extractToolResultImages } from "./utils.js";
 import { HIDDEN_TOOLS, INTERACTIVE_TOOLS, isGroupableTool } from "./tools.js";
 
@@ -81,7 +81,36 @@ export function walkCurrentBranch(messages: JSONLMessage[]): JSONLMessage[] {
 /**
  * Process system/progress/internal message types.
  */
-export function processNonConversation(_msg: JSONLMessage): ProcessedMessage | null {
+export function processNonConversation(msg: JSONLMessage): ProcessedMessage | null {
+  // Diagnostics attachments — LSP error/warning counts grouped by file. Mirrors
+  // upstream's DiagnosticsDisplay summary line. Severity 1=Error, 2=Warning,
+  // 3=Info, 4=Hint per LSP spec.
+  if (msg.type === "attachment" && msg.attachment?.type === "diagnostics") {
+    const files = msg.attachment.files || [];
+    if (files.length === 0) return null;
+    let errors = 0;
+    let warnings = 0;
+    for (const f of files) {
+      for (const d of f.diagnostics) {
+        if (d.severity === 1) errors++;
+        else if (d.severity === 2) warnings++;
+      }
+    }
+    if (errors === 0 && warnings === 0) return null;
+    const fileLabels = files.slice(0, 3).map((f) => {
+      const name = f.uri.replace(/^file:\/\//, "").replace(/^_claude_fs_right:/, "").split(/[/\\]/).pop() ?? f.uri;
+      return name;
+    }).join(", ");
+    const more = files.length > 3 ? ` +${files.length - 3} more` : "";
+    const parts: string[] = [];
+    if (errors > 0) parts.push(`🔴 ${errors} error${errors === 1 ? "" : "s"}`);
+    if (warnings > 0) parts.push(`🟡 ${warnings} warning${warnings === 1 ? "" : "s"}`);
+    return {
+      type: "diagnostics",
+      content: `${parts.join("  ")}  *in ${fileLabels}${more}*`,
+      uuid: msg.uuid,
+    };
+  }
   // System messages (turn_duration, etc.) are not forwarded to Discord — they're noise
   return null;
 }
@@ -109,7 +138,46 @@ export function processAssistantBlocks(msg: JSONLMessage): ProcessedMessage[] {
 
   const results: ProcessedMessage[] = [];
   for (const block of blocks) {
-    if (block.type === "thinking") continue;
+    if (block.type === "thinking") {
+      const tb = block as ContentBlockThinking;
+      const text = tb.thinking?.trim();
+      if (text) results.push({ type: "thinking", content: text, uuid: msg.uuid });
+      continue;
+    }
+
+    if ((block as { type: string }).type === "redacted_thinking") {
+      results.push({ type: "thinking", content: "", uuid: msg.uuid, toolName: "redacted" });
+      continue;
+    }
+
+    if ((block as { type: string }).type === "server_tool_use") {
+      const sb = block as ContentBlockServerToolUse;
+      results.push({
+        type: "web-search",
+        content: String((sb.input as Record<string, unknown>).query ?? sb.name),
+        uuid: msg.uuid,
+        toolName: sb.name,
+        toolUseId: sb.id,
+        toolInput: sb.input,
+      });
+      continue;
+    }
+
+    if ((block as { type: string }).type === "web_search_tool_result") {
+      const wb = block as ContentBlockWebSearchToolResult;
+      const hits = Array.isArray(wb.content) ? wb.content : [];
+      const lines = hits.slice(0, 5).map((h) => {
+        const t = (h.title || "").trim() || h.url || "(untitled)";
+        return h.url ? `• [${t.slice(0, 80)}](${h.url})` : `• ${t.slice(0, 80)}`;
+      });
+      results.push({
+        type: "web-search",
+        content: lines.length > 0 ? lines.join("\n") : "*(no results)*",
+        uuid: msg.uuid,
+        toolUseId: wb.tool_use_id,
+      });
+      continue;
+    }
 
     if (block.type === "text" && block.text.trim()) {
       const trimmed = block.text.trim();

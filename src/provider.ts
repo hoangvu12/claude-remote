@@ -72,7 +72,7 @@ export interface UserAttachment {
 
 /** Optional: provider supports receiving user input */
 export interface InputCapable {
-  onUserMessage(cb: (text: string, attachments?: UserAttachment[]) => void): void;
+  onUserMessage(cb: (text: string, attachments?: UserAttachment[], userId?: string) => void): void;
   onInteraction(cb: (interaction: ProviderInteraction) => void): void;
   respond(interaction: ProviderInteraction, msg: OutgoingMessage): Promise<void>;
 }

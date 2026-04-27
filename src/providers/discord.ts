@@ -42,7 +42,7 @@ export class DiscordProvider implements OutputProvider, ThreadCapable, InputCapa
   private messageTimes: number[] = [];
   private messageCache = new Map<string, Message>();
   private threadCache = new Map<string, ThreadChannel>();
-  private userMessageCb?: (text: string, attachments?: UserAttachment[]) => void;
+  private userMessageCb?: (text: string, attachments?: UserAttachment[], userId?: string) => void;
   private interactionCb?: (interaction: ProviderInteraction) => void;
   private boundHandleMessage: (msg: Message) => void;
   private boundHandleInteraction: (interaction: import("discord.js").Interaction) => void;
@@ -134,7 +134,7 @@ export class DiscordProvider implements OutputProvider, ThreadCapable, InputCapa
 
   // ── InputCapable ──
 
-  onUserMessage(cb: (text: string, attachments?: UserAttachment[]) => void): void {
+  onUserMessage(cb: (text: string, attachments?: UserAttachment[], userId?: string) => void): void {
     this.userMessageCb = cb;
   }
 
@@ -173,7 +173,7 @@ export class DiscordProvider implements OutputProvider, ThreadCapable, InputCapa
     }
 
     if (!text && attachments.length === 0) return;
-    this.userMessageCb?.(text, attachments.length > 0 ? attachments : undefined);
+    this.userMessageCb?.(text, attachments.length > 0 ? attachments : undefined, message.author.id);
   }
 
   private async handleInteraction(interaction: import("discord.js").Interaction) {

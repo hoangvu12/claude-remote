@@ -74,6 +74,48 @@ export function renderMessage(msg: ProcessedMessage): OutgoingMessage[] {
     case "assistant-text":
       return splitContent(msg.content).map((chunk) => ({ text: chunk }));
 
+    case "thinking": {
+      // Mirror upstream's collapsed "∴ Thinking" summary. Discord spoiler
+      // (`||...||`) lets users tap to expand on mobile / hover on desktop.
+      // Redacted thinking has no body — surface only the marker line.
+      if (msg.toolName === "redacted") {
+        return [{ embed: { description: "✻ *Thinking…* (redacted)", color: COLOR.SYSTEM } }];
+      }
+      const text = msg.content.trim();
+      if (!text) return [];
+      const preview = text.length > 1800 ? `${text.slice(0, 1800)}…` : text;
+      return [{
+        embed: {
+          description: `∴ **Thinking**\n||${preview}||`,
+          color: COLOR.SYSTEM,
+        },
+      }];
+    }
+
+    case "web-search": {
+      // Two flavors: server_tool_use (Claude calling web_search → query line)
+      // and web_search_tool_result (grouped link list rendered as markdown).
+      if (msg.toolName) {
+        return [{
+          embed: {
+            description: `🌐 **Web search** \`${truncate(msg.content, 200)}\``,
+            color: COLOR.TOOL,
+          },
+        }];
+      }
+      return [{
+        embed: {
+          description: msg.content.slice(0, MAX_EMBED_DESC),
+          color: COLOR.TOOL_OK,
+        },
+      }];
+    }
+
+    case "diagnostics":
+      return [{
+        embed: { description: msg.content.slice(0, MAX_EMBED_DESC), color: COLOR.SYSTEM },
+      }];
+
     case "tool-use":
       return [{
         embed: {

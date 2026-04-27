@@ -33,11 +33,41 @@ export interface ContentBlockThinking {
   thinking: string;
 }
 
+export interface ContentBlockRedactedThinking {
+  type: "redacted_thinking";
+  data?: string;
+}
+
+/** Claude API server-side tool calls — web_search, web_fetch, code_execution.
+ *  See ContentBlockServerToolUse in Anthropic SDK. */
+export interface ContentBlockServerToolUse {
+  type: "server_tool_use";
+  id: string;
+  name: string;
+  input: Record<string, unknown>;
+}
+
+/** Result of `server_tool_use` for web_search — array of {url,title,...} hits. */
+export interface ContentBlockWebSearchToolResult {
+  type: "web_search_tool_result";
+  tool_use_id: string;
+  content: Array<{
+    type: "web_search_result";
+    url?: string;
+    title?: string;
+    page_age?: string | null;
+    encrypted_content?: string;
+  }> | { type: "web_search_tool_result_error"; error_code?: string };
+}
+
 export type ContentBlock =
   | ContentBlockText
   | ContentBlockToolUse
   | ContentBlockToolResult
   | ContentBlockThinking
+  | ContentBlockRedactedThinking
+  | ContentBlockServerToolUse
+  | ContentBlockWebSearchToolResult
   | ContentBlockImage;
 
 /**
@@ -95,6 +125,18 @@ export interface JSONLMessage {
     content: ContentBlock[] | string;
     model?: string;
     stop_reason?: string | null;
+    /**
+     * Token + cache usage for this assistant turn. Present on assistant
+     * messages; daemon accumulates these across the session for the
+     * Stop-event cost/context footer.
+     */
+    usage?: {
+      input_tokens?: number;
+      output_tokens?: number;
+      cache_read_input_tokens?: number;
+      cache_creation_input_tokens?: number;
+      server_tool_use?: { web_search_requests?: number };
+    };
   };
   data?: Record<string, unknown>;
   /** Parent Agent tool_use ID (for sidechain/subagent work). */
@@ -104,6 +146,25 @@ export interface JSONLMessage {
   cwd?: string;
   version?: string;
   gitBranch?: string;
+  /**
+   * `attachment` entries carry typed sub-payloads — diagnostics, queued
+   * commands, plan-mode reentry, etc. We only render the diagnostics shape;
+   * the rest are filtered out by daemon.ts' attachment handler.
+   */
+  attachment?: {
+    type?: string;
+    files?: Array<{
+      uri: string;
+      diagnostics: Array<{
+        severity: number;
+        message: string;
+        range?: { start: { line: number; character: number } };
+        code?: string | number;
+        source?: string;
+      }>;
+    }>;
+    isNew?: boolean;
+  };
   /** `system` subtype-specific metadata. Shapes vary; access narrowly. */
   compactMetadata?: {
     trigger?: "manual" | "auto";
@@ -244,12 +305,30 @@ export interface DaemonPermissionRequestMessage {
   permissionMode?: string;
 }
 
+/**
+ * Elicitation hook → daemon. Sent by `elicitation-hook.ts` when an MCP
+ * server requests user input via the MCP elicitation protocol. Daemon
+ * holds the socket open until the user submits a Discord modal, then
+ * writes back an action ("accept"/"decline"/"cancel") + optional content.
+ */
+export interface DaemonElicitationRequestMessage {
+  type: "elicitation-request";
+  sessionId: string;
+  elicitationId?: string;
+  mcpServerName?: string;
+  message?: string;
+  mode?: "form" | "url";
+  url?: string;
+  requestedSchema?: Record<string, unknown>;
+}
+
 export type DaemonToClient = PtyWriteMessage | DaemonReadyMessage | DaemonRestartMessage;
 export type ClientToDaemon =
   | SessionInfoMessage
   | DaemonStateSignalMessage
   | SessionDisconnectMessage
-  | DaemonPermissionRequestMessage;
+  | DaemonPermissionRequestMessage
+  | DaemonElicitationRequestMessage;
 
 // ── Named pipe messages (hook → rc) ──
 
@@ -302,6 +381,7 @@ export type PipeMessage = PipeEnableMessage | PipeDisableMessage | PipeStatusMes
 export type DiscordMessageType =
   | "user-prompt"
   | "assistant-text"
+  | "thinking"
   | "tool-use"
   | "tool-use-group"
   | "tool-result"
@@ -311,6 +391,8 @@ export type DiscordMessageType =
   | "turn-duration"
   | "api-error"
   | "microcompact"
+  | "diagnostics"
+  | "web-search"
   | "status";
 
 export interface ProcessedMessage {

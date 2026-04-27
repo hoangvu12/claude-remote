@@ -11,6 +11,14 @@ export class ThinkingHandler implements MessageHandler {
       return "consumed";
     }
 
+    // Mirror upstream's AssistantThinkingMessage / AssistantRedactedThinking
+    // rendering — Claude's reasoning trail surfaced as a collapsed embed so
+    // users can verify intent without leaving the channel.
+    if (pm.type === "thinking") {
+      await sendRendered(ctx.provider, pm);
+      return "consumed";
+    }
+
     return "pass";
   }
 }

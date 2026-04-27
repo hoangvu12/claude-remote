@@ -113,15 +113,26 @@ export class ActivityManager {
 
   tryDequeue() {
     if (this.busy || this.queue.length === 0 || !this.ctx) return;
-    const next = this.queue.shift()!;
+    // Drain ALL queued messages at once — mirrors upstream's queueProcessor
+    // dequeueAllMatching, which submits everything in the same mode as one
+    // turn. One PTY paste, one Discord embed, one API round-trip — saves
+    // 3-5× latency over per-message dispatch.
+    const drained = this.queue.splice(0);
+    const combined = drained.map((m) => m.text).join("\n\n");
     this.busy = true;
     this.resetIdleTimer();
-    this.ctx.originMessages.add(next.text.trim());
-    this.sendToClient({ type: "pty-write", text: next.text });
+    this.ctx.originMessages.add(combined.trim());
+    this.sendToClient({ type: "pty-write", text: combined });
     this.update("thinking");
+
+    const ids = drained.map((m) => `#${m.id}`).join(", ");
+    const preview = drained[0].text.slice(0, 200);
+    const more = drained.length > 1 ? ` *(+${drained.length - 1} more)*` : "";
     this.provider.send({
       embed: {
-        description: `📤 Sending queued message #${next.id} (${this.queue.length} remaining)\n>>> ${next.text.slice(0, 200)}`,
+        description: drained.length === 1
+          ? `📤 Sending queued message ${ids}\n>>> ${preview}`
+          : `📤 Sending ${drained.length} queued messages [${ids}]\n>>> ${preview}${more}`,
         color: COLOR.BLURPLE,
       },
     });
