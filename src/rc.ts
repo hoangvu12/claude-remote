@@ -283,16 +283,21 @@ function handleDaemonMessage(msg: DaemonToClient) {
     lastChannelId = msg.channelId;
     setStatusFlag(true);
   } else if (msg.type === "restart") {
-    restartClaude();
+    // resumeSessionId === null  → fresh start (no --resume)
+    // resumeSessionId === string → resume that specific id
+    // resumeSessionId === undefined → resume current session (default)
+    let target: string | null;
+    if (msg.resumeSessionId === null) target = null;
+    else if (typeof msg.resumeSessionId === "string") target = msg.resumeSessionId;
+    else target = sessionId;
+    restartClaude(target);
   }
 }
 
-function restartClaude() {
+function restartClaude(target: string | null) {
   if (restarting || !proc) return;
   restarting = true;
-  // Capture the current session id so onExit can respawn with --resume and
-  // continue the same conversation instead of starting a fresh one.
-  resumeSessionId = sessionId;
+  resumeSessionId = target;
   // Claude Code's useExitOnCtrlCD wants two presses of the SAME key within a
   // ~2s window. Mixing Ctrl+C and Ctrl+D resets each other's pending state and
   // never confirms. Cancel any in-flight work with Escape first, then double

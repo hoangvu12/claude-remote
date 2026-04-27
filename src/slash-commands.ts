@@ -4,22 +4,33 @@ import {
   TextInputBuilder,
   TextInputStyle,
   ActionRowBuilder,
+  StringSelectMenuBuilder,
   Events,
   type Client,
   type ChatInputCommandInteraction,
 } from "discord.js";
+import fsp from "node:fs/promises";
+import path from "node:path";
 import type { DiscordProvider } from "./providers/discord.js";
 import type { SessionContext } from "./handler.js";
 import type { PtyWriteMessage } from "./types.js";
 import { ActivityManager, STATUS_LABELS, type ActivityState } from "./activity.js";
-import { modeShiftTabCount, getModeCycle, isModeReachable, MODE_LABELS, ID_PREFIX } from "./utils.js";
+import { modeShiftTabCount, getModeCycle, isModeReachable, MODE_LABELS, ID_PREFIX, encodeProjectPath, getClaudeDir, truncate } from "./utils.js";
 import { COLOR } from "./discord-renderer.js";
+
+const RESUME_PICK_PREFIX = "resume-pick:";
 
 export interface SlashCommandDeps {
   getCtx: () => SessionContext | null;
   activity: ActivityManager;
   sendToClient: (msg: Omit<PtyWriteMessage, "sessionKey">) => void;
-  restart: () => void;
+  /**
+   * Restart the rc.ts Claude child.
+   * - undefined → resume the current session (default /restart behavior)
+   * - null      → start fresh, no --resume (used by /new)
+   * - string    → resume that specific session id (used by /resume picker)
+   */
+  restart: (resumeSessionId?: string | null) => void;
   provider: DiscordProvider;
   projectDir: string;
   sessionId: string;
@@ -84,7 +95,10 @@ export async function setupSlashCommands(
       .setDescription("Interrupt Claude (like pressing Escape)"),
     new SlashCommandBuilder()
       .setName("restart")
-      .setDescription("Restart the Claude CLI session (same args, fresh process)"),
+      .setDescription("Restart the Claude CLI and resume the same conversation"),
+    new SlashCommandBuilder()
+      .setName("new")
+      .setDescription("Restart the Claude CLI in a fresh, empty conversation"),
     new SlashCommandBuilder()
       .setName("key")
       .setDescription("Send raw keypresses to Claude CLI")
@@ -114,10 +128,10 @@ export async function setupSlashCommands(
       .setDescription("Rewind the conversation (like Ctrl+G in the TTY)"),
     new SlashCommandBuilder()
       .setName("resume")
-      .setDescription("Resume a previous session by id (restarts Claude with --resume)")
+      .setDescription("Resume a previous conversation (restarts Claude with --resume)")
       .addStringOption((opt) =>
         opt.setName("id")
-          .setDescription("Session id or search term (blank = pick from list in TTY)")
+          .setDescription("Session id (blank = show picker of recent sessions)")
           .setRequired(false)
       ),
     new SlashCommandBuilder()
@@ -174,8 +188,25 @@ export async function setupSlashCommands(
   }
 
   const handler = async (interaction: import("discord.js").Interaction) => {
-    if (!interaction.isChatInputCommand()) return;
     if (interaction.channelId !== deps.channelId) return;
+
+    if (interaction.isStringSelectMenu() && interaction.customId.startsWith(RESUME_PICK_PREFIX)) {
+      const target = interaction.values[0];
+      if (!target) {
+        await interaction.update({ content: "⚠️ No selection received.", components: [] });
+        return;
+      }
+      deps.restart(target);
+      deps.activity.busy = false;
+      deps.activity.update("idle", client);
+      await interaction.update({
+        content: `↩️ Resuming \`${target.slice(0, 8)}\`...`,
+        components: [],
+      });
+      return;
+    }
+
+    if (!interaction.isChatInputCommand()) return;
     const cmd = interaction as ChatInputCommandInteraction;
     const { activity, sendToClient, getCtx } = deps;
 
@@ -264,7 +295,13 @@ export async function setupSlashCommands(
         deps.restart();
         activity.busy = false;
         activity.update("idle", client);
-        await cmd.reply({ content: "🔄 Restarting Claude...", ephemeral: true });
+        await cmd.reply({ content: "🔄 Restarting Claude (resuming current conversation)...", ephemeral: true });
+        break;
+      case "new":
+        deps.restart(null);
+        activity.busy = false;
+        activity.update("idle", client);
+        await cmd.reply({ content: "🆕 Starting a fresh conversation...", ephemeral: true });
         break;
       case "key": {
         const input = cmd.options.getString("keys", true);
@@ -291,9 +328,34 @@ export async function setupSlashCommands(
         break;
       case "resume": {
         const id = cmd.options.getString("id") || "";
-        const payload = id.trim() ? `/resume ${id.trim()}` : "/resume";
-        sendToClient({ type: "pty-write", text: payload, raw: false });
-        await cmd.reply({ content: id ? `↩️ Resuming \`${id}\`...` : "↩️ Showing resume picker...", ephemeral: true });
+        if (id.trim()) {
+          deps.restart(id.trim());
+          activity.busy = false;
+          activity.update("idle", client);
+          await cmd.reply({ content: `↩️ Resuming \`${id.trim().slice(0, 8)}\`...`, ephemeral: true });
+          break;
+        }
+        const sessions = await listRecentSessions(deps.projectDir, 25);
+        if (sessions.length === 0) {
+          await cmd.reply({
+            content: "📭 No previous conversations found for this project.",
+            ephemeral: true,
+          });
+          break;
+        }
+        const select = new StringSelectMenuBuilder()
+          .setCustomId(`${RESUME_PICK_PREFIX}${cmd.id}`)
+          .setPlaceholder("Pick a conversation to resume")
+          .addOptions(sessions.map((s) => ({
+            label: truncate(s.label, 100),
+            description: truncate(s.preview, 100) || undefined,
+            value: s.sessionId,
+          })));
+        await cmd.reply({
+          content: `↩️ ${sessions.length} recent conversation${sessions.length === 1 ? "" : "s"}:`,
+          components: [new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(select)],
+          ephemeral: true,
+        });
         break;
       }
       case "plan": {
@@ -346,6 +408,113 @@ export async function setupSlashCommands(
 
   client.on(Events.InteractionCreate, handler);
   return () => client.removeListener(Events.InteractionCreate, handler);
+}
+
+// ── Recent-sessions picker for /resume ──
+
+interface RecentSession {
+  sessionId: string;
+  /** Timestamp + first-message preview, used for the menu option label. */
+  label: string;
+  /** Longer first-user-message preview, used for the option's secondary line. */
+  preview: string;
+  mtimeMs: number;
+}
+
+/**
+ * List the N most recent JSONL sessions for `projectDir`, newest first. The
+ * label is "{relative-time} · {short-preview}" and the preview is a longer
+ * cut of the first user message, parsed from the JSONL file head.
+ */
+async function listRecentSessions(projectDir: string, limit: number): Promise<RecentSession[]> {
+  const projectsDir = path.join(getClaudeDir(), "projects", encodeProjectPath(projectDir));
+  let entries: string[];
+  try {
+    entries = await fsp.readdir(projectsDir);
+  } catch {
+    return [];
+  }
+
+  const candidates = await Promise.all(
+    entries
+      .filter((f) => f.endsWith(".jsonl"))
+      .map(async (f) => {
+        const full = path.join(projectsDir, f);
+        try {
+          const stat = await fsp.stat(full);
+          if (stat.size === 0) return null;
+          return { full, sessionId: f.slice(0, -".jsonl".length), mtimeMs: stat.mtimeMs };
+        } catch {
+          return null;
+        }
+      })
+  );
+
+  const sorted = candidates
+    .filter((c): c is { full: string; sessionId: string; mtimeMs: number } => c !== null)
+    .sort((a, b) => b.mtimeMs - a.mtimeMs)
+    .slice(0, limit);
+
+  return Promise.all(sorted.map(async (c) => {
+    const preview = await readFirstUserMessage(c.full);
+    const label = `${formatRelativeTime(c.mtimeMs)} · ${preview || c.sessionId.slice(0, 8)}`;
+    return { sessionId: c.sessionId, label, preview, mtimeMs: c.mtimeMs };
+  }));
+}
+
+/**
+ * Read the first user message text from a JSONL transcript without loading the
+ * whole file. Reads up to 64 KB from the head, splits on newlines, and walks
+ * forward until it finds a `type:"user"` row whose content has a text block
+ * not produced by a tool result or local-command tag.
+ */
+async function readFirstUserMessage(jsonlPath: string): Promise<string> {
+  let buf: Buffer;
+  try {
+    const fd = await fsp.open(jsonlPath, "r");
+    try {
+      const chunk = Buffer.alloc(64 * 1024);
+      const { bytesRead } = await fd.read(chunk, 0, chunk.length, 0);
+      buf = chunk.subarray(0, bytesRead);
+    } finally {
+      await fd.close();
+    }
+  } catch {
+    return "";
+  }
+
+  const lines = buf.toString("utf-8").split("\n");
+  for (const line of lines) {
+    if (!line) continue;
+    let msg: { type?: string; message?: { content?: unknown }; isMeta?: boolean };
+    try { msg = JSON.parse(line); } catch { continue; }
+    if (msg.type !== "user" || msg.isMeta) continue;
+    const content = msg.message?.content;
+    let text = "";
+    if (typeof content === "string") text = content;
+    else if (Array.isArray(content)) {
+      for (const block of content as Array<{ type?: string; text?: string }>) {
+        if (block.type === "text" && block.text) { text = block.text; break; }
+      }
+    }
+    if (!text) continue;
+    // Skip Claude Code's local-command synthetic user rows (e.g. /clear output).
+    if (text.startsWith("<local-command-stdout>") || text.startsWith("<command-")) continue;
+    return text.replace(/\s+/g, " ").trim().slice(0, 200);
+  }
+  return "";
+}
+
+function formatRelativeTime(ms: number): string {
+  const diff = Date.now() - ms;
+  const min = Math.round(diff / 60000);
+  if (min < 1) return "just now";
+  if (min < 60) return `${min}m ago`;
+  const hr = Math.round(min / 60);
+  if (hr < 24) return `${hr}h ago`;
+  const day = Math.round(hr / 24);
+  if (day < 30) return `${day}d ago`;
+  return new Date(ms).toLocaleDateString();
 }
 
 // ── Key parsing for /key command ──

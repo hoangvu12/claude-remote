@@ -218,6 +218,13 @@ export interface DaemonStateSignalMessage {
 export interface DaemonRestartMessage {
   type: "restart";
   sessionKey: string;
+  /**
+   * If set, respawn Claude with `--resume <resumeSessionId>` to continue that
+   * specific session. If undefined, default behavior: resume the current
+   * session id (used by /restart). If explicitly null, force a fresh session
+   * (used by /new).
+   */
+  resumeSessionId?: string | null;
 }
 
 /**
