@@ -82,6 +82,16 @@ export function renderMessage(msg: ProcessedMessage): OutgoingMessage[] {
         },
       }];
 
+    case "tool-use-group": {
+      const n = msg.toolUseIds?.length ?? 0;
+      return [{
+        embed: {
+          description: `🔧 **${msg.toolName}** × ${n}`,
+          color: COLOR.TOOL,
+        },
+      }];
+    }
+
     case "tool-result": {
       if (!msg.content.trim() || msg.content === "undefined") return [];
       return [{

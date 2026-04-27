@@ -90,7 +90,10 @@ export class ToolResultHandler implements MessageHandler {
 
     const provider = ctx.provider;
     const icon = isError ? "❌" : "✅";
-    const label = `**${entry.toolName}** — \`${truncate(entry.content, 80)}\``;
+    const durSuffix = entry.durationMs != null
+      ? ` *(${(entry.durationMs / 1000).toFixed(entry.durationMs >= 10_000 ? 0 : 1)}s)*`
+      : "";
+    const label = `**${entry.toolName}** — \`${truncate(entry.content, 80)}\`${durSuffix}`;
     const color = resultColor(isError);
 
     // Passive group results → buffer only; group closes via non-passive tool, text, or idle.

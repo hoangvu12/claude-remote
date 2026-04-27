@@ -19,6 +19,7 @@ import { closePassiveGroup } from "./handlers/passive-tools.js";
 import { closeAllMcpGroups } from "./handlers/mcp-tools.js";
 import { ActivityManager } from "./activity.js";
 import { setupSlashCommands } from "./slash-commands.js";
+import { ensureHooksInstalled } from "./install-hooks.js";
 
 // ── Constants ──
 
@@ -91,6 +92,13 @@ const sessions = new Map<string, Session>();
 const channelToSessionKey = new Map<string, string>();
 let commandsRegistered = false;
 let pipeServer: net.Server | null = null;
+/**
+ * Maps Claude's subagent agent_id → the spawning Task/Agent tool_use_id so
+ * SubagentStop can reach the right parent thread. Populated by SubagentStart
+ * signals, drained by SubagentStop. Single map across sessions is fine —
+ * agent_ids are globally unique within a Claude install.
+ */
+const subagentParents = new Map<string, string>();
 
 // ── Helpers ──
 
@@ -358,12 +366,13 @@ async function handleFileChange(session: Session, filePath: string) {
       if (activity?.busy) activity.resetIdleTimer();
 
       if (activity && Date.now() >= activity.stopOverrideUntil) {
-        if (msg.type === "assistant" && (msg as unknown as Record<string, unknown>).isApiErrorMessage) {
-          await ctx.provider.send({
-            embed: { description: "⚠️ **API error** — request failed (Claude returned an error)", color: COLOR.ERROR_RED },
-          });
-          activity.transitionToIdle();
-        } else if (msg.type === "assistant" && msg.message && Array.isArray(msg.message.content)) {
+        // API-error rendering is now driven by the StopFailure hook
+        // (handleStateSignal "stop-failure"), which carries the structured
+        // error code + detail. The legacy `msg.isApiErrorMessage` cast lives
+        // on for transcripts written before the hook was installed; the
+        // synthetic-model branch above already swallows those, so no extra
+        // handling is needed here.
+        if (msg.type === "assistant" && msg.message && Array.isArray(msg.message.content)) {
           const blocks = msg.message.content as ContentBlock[];
           const hasToolUse = blocks.some((b) => b.type === "tool_use");
           if (hasToolUse) {
@@ -653,6 +662,8 @@ async function replayHistory(session: Session) {
           textMessages.push(`**Claude**: ${pm.content.slice(0, 100)}${pm.content.length > 100 ? "…" : ""}`);
         } else if (pm.type === "tool-use" || pm.type === "tool-result" || pm.type === "tool-result-error") {
           toolCount++;
+        } else if (pm.type === "tool-use-group") {
+          toolCount += pm.toolUseIds?.length ?? 1;
         }
       }
       const lines: string[] = [];
@@ -760,7 +771,13 @@ function wireDiscordInput(session: Session) {
       if (id.startsWith(ID_PREFIX.ALLOW)) {
         const toolUseId = id.slice(ID_PREFIX.ALLOW.length);
         ctx.resolvedToolUseIds.add(toolUseId);
-        sendKeySequence(session, [ENTER]);
+        // Prefer the PermissionRequest hook channel when a subprocess is
+        // waiting — that returns a structured allow decision and bypasses the
+        // dialog entirely. Fall through to ENTER only when no hook is active
+        // (older Claude, hook misregistered, or click beat the hook).
+        if (!resolvePermissionViaHook(toolUseId, { behavior: "allow" })) {
+          sendKeySequence(session, [ENTER]);
+        }
         provider.respond(interaction, { text: "✅ Allowed" });
         return;
       }
@@ -768,12 +785,15 @@ function wireDiscordInput(session: Session) {
       if (id.startsWith(ID_PREFIX.DENY)) {
         const toolUseId = id.slice(ID_PREFIX.DENY.length);
         ctx.resolvedToolUseIds.add(toolUseId);
-        // Escape triggers PermissionPrompt's handleCancel → onReject, which is
-        // equivalent to selecting "No" regardless of how many options the dialog
-        // shows. Arrow-down+Enter was index 1, which in the 3-option dialog
+        // Hook channel returns a deterministic deny; the keyboard-sim fallback
+        // sends Escape which triggers PermissionPrompt's handleCancel → onReject
+        // (equivalent to "No" regardless of how many options the dialog shows).
+        // Arrow-down+Enter was index 1, which in the 3-option dialog
         // ([Yes, Yes-dont-ask-again, No] when showAlwaysAllowOptions=true) picks
         // "Yes, don't ask again" — the opposite of Deny.
-        sendKeySequence(session, [ESCAPE]);
+        if (!resolvePermissionViaHook(toolUseId, { behavior: "deny", message: "Denied via Discord" })) {
+          sendKeySequence(session, [ESCAPE]);
+        }
         provider.respond(interaction, { text: "❌ Denied" });
         return;
       }
@@ -1133,16 +1153,30 @@ async function cleanupSession(sessionKey: string) {
 // ── Pipe connection handler ──
 
 function handleConnection(socket: net.Socket) {
+  // Tracks which sessionKey owns this socket for cleanup-on-close. Permission-
+  // request connections don't carry a sessionKey (they come from short-lived
+  // hook subprocesses, not rc.ts), so we leave connSessionKey null for them
+  // — closing them must NOT trigger session cleanup.
   let connSessionKey: string | null = null;
 
   socket.on("data", createLineParser((line) => {
     let msg: ClientToDaemon;
     try { msg = JSON.parse(line); } catch { return; }
-    connSessionKey = msg.sessionKey;
+    if ("sessionKey" in msg && msg.sessionKey) connSessionKey = msg.sessionKey;
     handleClientMessage(msg, socket);
   }));
 
   socket.on("close", () => {
+    // Permission-request socket close: drop any pending hook responder bound
+    // to this socket so a stale entry can't be used after the hook subprocess
+    // dies (e.g. timed out, killed). Not strictly required for correctness —
+    // the responder would just never get a response — but keeps the map tidy.
+    for (const [toolUseId, pending] of pendingPermissions) {
+      if (pending.socket === socket) {
+        clearTimeout(pending.timer);
+        pendingPermissions.delete(toolUseId);
+      }
+    }
     if (connSessionKey) {
       const session = sessions.get(connSessionKey);
       if (session && session.socket === socket) {
@@ -1165,6 +1199,28 @@ async function handleStateSignal(session: Session, msg: Extract<ClientToDaemon, 
       // signal is purely a state transition.
       activity.transitionToIdle();
       break;
+    case "stop-failure": {
+      // Replaces the brittle `isApiErrorMessage` JSONL field check. StopFailure
+      // fires when the assistant turn ends because the API returned an error;
+      // the hook payload carries the structured error code + human detail.
+      const code = msg.errorCode || "unknown";
+      const detail = msg.errorDetails ? truncate(msg.errorDetails, 300) : "";
+      const labels: Record<string, string> = {
+        authentication_failed: "Authentication failed",
+        billing_error: "Billing error",
+        rate_limit: "Rate limited",
+        invalid_request: "Invalid request",
+        server_error: "Server error",
+        unknown: "API error",
+      };
+      const headline = labels[code] || `API error (${code})`;
+      const body = detail ? `: ${detail}` : "";
+      await ctx.provider.send({
+        embed: { description: `⚠️ **${headline}**${body}`, color: COLOR.ERROR_RED },
+      });
+      activity.transitionToIdle();
+      break;
+    }
     case "post-compact":
       if (msg.trigger === "manual") activity.transitionToIdle();
       // Auto compact boundary is already rendered from the JSONL compact_boundary
@@ -1217,6 +1273,61 @@ async function handleStateSignal(session: Session, msg: Extract<ClientToDaemon, 
       // tool-use rendering path; we skip them to avoid double-posts.
       break;
     }
+    case "tool-start": {
+      // Activity flips to "working" the moment Claude starts the tool, instead
+      // of waiting on chokidar's ~250ms write-finish window. Idempotent — the
+      // JSONL handler will redundantly call this when the tool_use block lands.
+      activity.update("working");
+      activity.busy = true;
+      activity.resetIdleTimer();
+      break;
+    }
+    case "tool-end":
+    case "tool-failure": {
+      // Tool finished — stop progress timer and mark resolved instantly so the
+      // tool-use handler's escalation window (300ms) skips redundant rendering
+      // when the result is already in. The JSONL tool_result render still
+      // runs ~250ms later and is the canonical source for content/output.
+      if (msg.toolUseId) {
+        ctx.resolvedToolUseIds.add(msg.toolUseId);
+        if (msg.durationMs != null) {
+          const entry = toolState.toolUseThreads.get(msg.toolUseId);
+          if (entry) entry.durationMs = msg.durationMs;
+        }
+        await toolState.cleanupProgress(msg.toolUseId, ctx.provider);
+      }
+      activity.resetIdleTimer();
+      break;
+    }
+    case "subagent-start": {
+      // Track agent_id → parent Task tool_use_id so subagent-end can find the
+      // right thread to post into. Falls through to a no-op for orphan starts
+      // (parent_tool_use_id missing) — JSONL-driven render still works.
+      if (msg.agentId && msg.parentToolUseId) {
+        subagentParents.set(msg.agentId, msg.parentToolUseId);
+      }
+      break;
+    }
+    case "subagent-end":
+    case "subagent-failure": {
+      const isError = msg.event === "subagent-failure";
+      const parentId = msg.parentToolUseId
+        || (msg.agentId ? subagentParents.get(msg.agentId) : undefined);
+      if (msg.agentId) subagentParents.delete(msg.agentId);
+      if (!parentId) break;
+
+      const parentEntry = toolState.toolUseThreads.get(parentId);
+      if (!parentEntry?.thread || !hasThreads(ctx.provider)) break;
+
+      const dur = msg.durationMs != null ? ` in ${(msg.durationMs / 1000).toFixed(1)}s` : "";
+      const icon = isError ? "❌" : "✅";
+      try {
+        await ctx.provider.sendToThread(parentEntry.thread, {
+          text: `${icon} Subagent finished${dur}`,
+        });
+      } catch { /* best effort */ }
+      break;
+    }
   }
 }
 
@@ -1238,7 +1349,78 @@ async function handleClientMessage(msg: ClientToDaemon, socket: net.Socket) {
     await handleStateSignal(session, msg);
   } else if (msg.type === "session-disconnect") {
     await cleanupSession(msg.sessionKey);
+  } else if (msg.type === "permission-request") {
+    handlePermissionRequest(msg, socket);
   }
+}
+
+// ── PermissionRequest hook responders ──
+//
+// Each pending entry is a hook subprocess (permission-hook.ts) waiting for an
+// Allow/Deny click. When the user clicks, we write the decision JSON back on
+// the held socket — Claude then applies that decision instead of waiting on
+// the in-terminal dialog. If the user clicks BEFORE the hook arrives, we fall
+// back to the legacy keyboard-simulation path; the hook, when it eventually
+// arrives, gets `passthrough` so it doesn't double-resolve.
+
+interface PendingPermission {
+  socket: net.Socket;
+  timer: ReturnType<typeof setTimeout>;
+}
+const pendingPermissions = new Map<string, PendingPermission>();
+const HOOK_RESPONSE_WINDOW_MS = 4 * 60 * 1000;
+
+function handlePermissionRequest(
+  msg: Extract<ClientToDaemon, { type: "permission-request" }>,
+  socket: net.Socket,
+) {
+  const writeBack = (payload: { behavior: "allow" | "deny" | "passthrough"; updatedInput?: Record<string, unknown>; message?: string }) => {
+    try { socket.write(JSON.stringify(payload) + "\n"); socket.end(); } catch { /* gone */ }
+  };
+
+  const session = [...sessions.values()].find((s) => s.sessionId === msg.sessionId);
+  if (!session) {
+    writeBack({ behavior: "passthrough" });
+    return;
+  }
+  // User already clicked → keyboard sim is in flight, hook lost the race.
+  if (session.ctx.resolvedToolUseIds.has(msg.toolUseId)) {
+    writeBack({ behavior: "passthrough" });
+    return;
+  }
+  // Replace any stale registration for this toolUseId (shouldn't happen but
+  // guard against a hook subprocess that retried).
+  const existing = pendingPermissions.get(msg.toolUseId);
+  if (existing) {
+    clearTimeout(existing.timer);
+    try { existing.socket.write(JSON.stringify({ behavior: "passthrough" }) + "\n"); existing.socket.end(); } catch { /* gone */ }
+  }
+  const timer = setTimeout(() => {
+    const p = pendingPermissions.get(msg.toolUseId);
+    if (!p || p.socket !== socket) return;
+    pendingPermissions.delete(msg.toolUseId);
+    writeBack({ behavior: "passthrough" });
+  }, HOOK_RESPONSE_WINDOW_MS);
+  pendingPermissions.set(msg.toolUseId, { socket, timer });
+}
+
+/**
+ * Returns true if a pending hook responder claimed the click — caller should
+ * skip the legacy keyboard-simulation fallback.
+ */
+function resolvePermissionViaHook(
+  toolUseId: string,
+  decision: { behavior: "allow"; updatedInput?: Record<string, unknown> } | { behavior: "deny"; message?: string },
+): boolean {
+  const pending = pendingPermissions.get(toolUseId);
+  if (!pending) return false;
+  pendingPermissions.delete(toolUseId);
+  clearTimeout(pending.timer);
+  try {
+    pending.socket.write(JSON.stringify(decision) + "\n");
+    pending.socket.end();
+  } catch { /* socket gone — keyboard sim would have been a no-op too */ }
+  return true;
 }
 
 // ── Main startup ──
@@ -1251,6 +1433,18 @@ async function main() {
   if (!token || !categoryId || !guildId) {
     console.error("[daemon] Missing DISCORD_BOT_TOKEN, DISCORD_GUILD_ID, or DISCORD_CATEGORY_ID");
     process.exit(1);
+  }
+
+  // Auto-heal: patch any missing claude-remote hooks into ~/.claude/settings.json
+  // on every boot. Lets users skip `claude-remote setup` after upgrading to a
+  // version that adds new hook events — without touching unrelated settings.
+  try {
+    const added = ensureHooksInstalled();
+    if (added.length > 0) {
+      console.log(`[daemon] Auto-installed missing hook(s): ${added.join(", ")}`);
+    }
+  } catch (err) {
+    console.warn("[daemon] Hook auto-heal failed (non-fatal):", err);
   }
 
   // Single Discord client for all sessions

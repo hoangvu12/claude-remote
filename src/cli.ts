@@ -8,6 +8,12 @@ import os from "node:os";
 import { execSync } from "node:child_process";
 import { createRequire } from "node:module";
 import { CONFIG_DIR, getClaudeDir } from "./utils.js";
+import {
+  EXPECTED_HOOKS,
+  cleanRemoteHooks,
+  getClaudeSettingsPath,
+  getHookCommand,
+} from "./install-hooks.js";
 import type { Config } from "./types.js";
 
 const CONFIG_FILE = path.join(CONFIG_DIR, "config.json");
@@ -52,10 +58,6 @@ function saveConfig(config: Config) {
   fs.writeFileSync(CONFIG_FILE, JSON.stringify(config, null, 2) + "\n");
 }
 
-function getClaudeSettingsPath(): string {
-  return path.join(getClaudeDir(), "settings.json");
-}
-
 function getSkillDir(): string {
   return path.join(getClaudeDir(), "skills", "remote");
 }
@@ -65,32 +67,9 @@ function getStatuslineCommand(): string {
   return `node "${scriptPath}"`;
 }
 
-// ── Skill & statusline management ──
-
-const HOOK_EVENT_TYPES = ["UserPromptSubmit", "SessionStart", "SessionEnd", "Stop", "PreCompact", "PostCompact", "Notification"];
-const HOOK_SCRIPT_NAMES = ["remote-hook", "discord-hook", "session-hook", "state-hook"];
-
-function isOurHook(h: Record<string, string>): boolean {
-  return HOOK_SCRIPT_NAMES.some((name) => h.command?.includes(name));
-}
-
-function cleanRemoteHooks(hooks: Record<string, unknown[]>) {
-  for (const eventType of HOOK_EVENT_TYPES) {
-    if (Array.isArray(hooks[eventType])) {
-      hooks[eventType] = hooks[eventType].filter((entry: unknown) => {
-        const e = entry as Record<string, unknown>;
-        const innerHooks = e.hooks as Array<Record<string, string>> | undefined;
-        return !innerHooks?.some(isOurHook);
-      });
-      if (hooks[eventType].length === 0) delete hooks[eventType];
-    }
-  }
-}
-
-function getHookCommand(scriptName: string): string {
-  const scriptPath = path.resolve(import.meta.dirname, `${scriptName}.js`);
-  return `node "${scriptPath}"`;
-}
+// Hook list, command resolver, and cleanRemoteHooks live in install-hooks.ts
+// — both this CLI installer and the daemon's startup auto-heal share them so
+// they can never drift.
 
 function installHooksAndStatusline() {
   // Remove old /discord skill if it exists (migration from discord-rc)
@@ -137,21 +116,13 @@ If you see this text, the hook did not intercept the prompt — run \`claude-rem
   // Clean old claude-remote hooks from all event types
   cleanRemoteHooks(hooks);
 
-  const addHook = (event: string, script: string) => {
+  for (const { event, script, timeoutMs } of EXPECTED_HOOKS) {
     if (!hooks[event]) hooks[event] = [];
     hooks[event].push({
       matcher: "",
-      hooks: [{ type: "command", command: getHookCommand(script), timeout: 5000 }],
+      hooks: [{ type: "command", command: getHookCommand(script), timeout: timeoutMs }],
     });
-  };
-
-  addHook("UserPromptSubmit", "remote-hook");
-  addHook("SessionStart", "session-hook");
-  addHook("SessionEnd", "state-hook");
-  addHook("Stop", "state-hook");
-  addHook("PreCompact", "state-hook");
-  addHook("PostCompact", "state-hook");
-  addHook("Notification", "state-hook");
+  }
 
   settings.hooks = hooks;
 

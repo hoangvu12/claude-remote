@@ -13,6 +13,23 @@ export const THREAD_TOOLS = new Set(["Bash", "Agent"]);
 export const INTERACTIVE_TOOLS = new Set(["AskUserQuestion"]);
 export const HIDDEN_TOOLS = new Set(["ToolSearch"]);
 
+/**
+ * Tools where 2+ parallel calls in a single assistant turn fold into one
+ * `tool-use-group` ProcessedMessage. Mirrors Claude Code's same-turn grouping
+ * (utils/groupToolUses.ts) — opt-in per tool because it only makes sense when
+ * the tool's input is small enough to summarize and the parallel pattern is
+ * common. Agent is intentionally excluded (each subagent has a distinct task).
+ *
+ * MCP tools (`mcp__*`) are *also* groupable but checked separately via
+ * `isGroupableTool` because they share a server-namespaced naming convention
+ * rather than a fixed name.
+ */
+export const GROUPABLE_TOOLS = new Set(["Read", "Grep", "Glob", "Edit", "Write", "Bash"]);
+
+export function isGroupableTool(name: string): boolean {
+  return GROUPABLE_TOOLS.has(name) || isMcpTool(name);
+}
+
 // ── Summary nouns for passive tool grouping ──
 
 const SUMMARY_NOUNS: Record<string, string> = {

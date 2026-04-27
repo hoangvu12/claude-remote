@@ -1,6 +1,15 @@
 import type { JSONLMessage, ContentBlock, ContentBlockToolUse, ProcessedMessage } from "./types.js";
 import { truncate, extractToolResultText, extractToolResultImages } from "./utils.js";
-import { HIDDEN_TOOLS, INTERACTIVE_TOOLS } from "./tools.js";
+import { HIDDEN_TOOLS, INTERACTIVE_TOOLS, isGroupableTool } from "./tools.js";
+
+function isHiddenToolUse(tb: ContentBlockToolUse): boolean {
+  if (HIDDEN_TOOLS.has(tb.name)) return true;
+  if (tb.name === "Bash") {
+    const cmd = String((tb.input as Record<string, unknown>).command || "");
+    if (cmd.includes("discord-cmd")) return true;
+  }
+  return false;
+}
 
 export function parseJSONLString(raw: string): JSONLMessage[] {
   const messages: JSONLMessage[] = [];
@@ -83,12 +92,26 @@ export function processNonConversation(_msg: JSONLMessage): ProcessedMessage | n
 export function processAssistantBlocks(msg: JSONLMessage): ProcessedMessage[] {
   if (msg.type !== "assistant" || !msg.message || !Array.isArray(msg.message.content)) return [];
 
+  const blocks = msg.message.content as ContentBlock[];
+
+  // Same-turn grouping pre-pass: count tool_use blocks by name (after filtering
+  // out hidden/discord-cmd ones). When a groupable tool appears 2+ times in a
+  // single assistant message we fold all those calls into one tool-use-group
+  // PM emitted in place of the first occurrence; later occurrences are skipped.
+  const toolNameCounts = new Map<string, number>();
+  for (const block of blocks) {
+    if (block.type !== "tool_use") continue;
+    const tb = block as ContentBlockToolUse;
+    if (isHiddenToolUse(tb)) continue;
+    toolNameCounts.set(tb.name, (toolNameCounts.get(tb.name) || 0) + 1);
+  }
+  const emittedGroups = new Set<string>();
+
   const results: ProcessedMessage[] = [];
-  for (const block of msg.message.content as ContentBlock[]) {
+  for (const block of blocks) {
     if (block.type === "thinking") continue;
 
     if (block.type === "text" && block.text.trim()) {
-      // Skip assistant text that's just echoing discord-cmd output
       const trimmed = block.text.trim();
       if (trimmed === "Discord sync enabled." || trimmed === "Discord sync disabled." || trimmed === "Discord sync enabled" || trimmed === "Discord sync disabled") continue;
       results.push({ type: "assistant-text", content: block.text, uuid: msg.uuid });
@@ -96,12 +119,28 @@ export function processAssistantBlocks(msg: JSONLMessage): ProcessedMessage[] {
 
     if (block.type === "tool_use") {
       const tb = block as ContentBlockToolUse;
+      if (isHiddenToolUse(tb)) continue;
 
-      // Skip internal tools
-      if (HIDDEN_TOOLS.has(tb.name)) continue;
-      if (tb.name === "Bash") {
-        const cmd = String((tb.input as Record<string, unknown>).command || "");
-        if (cmd.includes("discord-cmd")) continue;
+      const count = toolNameCounts.get(tb.name) || 0;
+      if (count >= 2 && isGroupableTool(tb.name)) {
+        if (emittedGroups.has(tb.name)) continue;
+        emittedGroups.add(tb.name);
+
+        const groupBlocks = blocks.filter(
+          (b): b is ContentBlockToolUse =>
+            b.type === "tool_use" &&
+            (b as ContentBlockToolUse).name === tb.name &&
+            !isHiddenToolUse(b as ContentBlockToolUse),
+        );
+        results.push({
+          type: "tool-use-group",
+          content: `${tb.name} × ${groupBlocks.length}`,
+          uuid: msg.uuid,
+          toolName: tb.name,
+          toolUseIds: groupBlocks.map((b) => b.id),
+          toolInputs: groupBlocks.map((b) => b.input),
+        });
+        continue;
       }
 
       if (INTERACTIVE_TOOLS.has(tb.name)) {

@@ -7,6 +7,7 @@ import { PassiveToolHandler } from "./handlers/passive-tools.js";
 import { ToolResultHandler } from "./handlers/tool-result.js";
 import { EditWriteHandler } from "./handlers/edit-write.js";
 import { ToolUseHandler } from "./handlers/tool-use.js";
+import { ToolUseGroupHandler } from "./handlers/tool-use-group.js";
 import { DefaultHandler } from "./handlers/default.js";
 
 /**
@@ -19,6 +20,7 @@ export function createPipeline(): HandlerPipeline {
   pipeline.register(new PlanModeHandler());       // EnterPlanMode/ExitPlanMode → status embed
   pipeline.register(new TaskHandler());           // Task* tools → pinned embed (before other tool handling)
   pipeline.register(new McpToolHandler());        // mcp__* tools → "Querying ServerName..." grouped
+  pipeline.register(new ToolUseGroupHandler());   // same-turn parallel calls → folded into one rendered group
   pipeline.register(new PassiveToolHandler());    // Read/Grep/Glob → grouped inline embed or thread
   pipeline.register(new ToolResultHandler());     // tool-result routing (inline/thread)
   pipeline.register(new EditWriteHandler());      // Edit/Write → inline display

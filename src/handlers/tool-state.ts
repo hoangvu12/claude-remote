@@ -20,6 +20,13 @@ export interface ToolEntry {
   content: string;
   cachedInput?: OutgoingMessage[];
   inlineMessage?: ProviderMessage | null;
+  /**
+   * Authoritative tool duration from PostToolUse hook (excludes permission
+   * prompts + PreToolUse latency). Threaded onto the ToolEntry so the result
+   * handler can include it in the final embed/thread title without re-deriving
+   * elapsed from setInterval timestamps.
+   */
+  durationMs?: number;
 }
 
 // ── Group result (shared by passive and MCP groups) ──

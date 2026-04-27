@@ -172,10 +172,17 @@ export interface DaemonReadyMessage {
 
 export type StateSignalEvent =
   | "stop"
+  | "stop-failure"
   | "post-compact"
   | "pre-compact"
   | "session-end"
-  | "notification";
+  | "notification"
+  | "tool-start"
+  | "tool-end"
+  | "tool-failure"
+  | "subagent-start"
+  | "subagent-end"
+  | "subagent-failure";
 
 export interface DaemonStateSignalMessage {
   type: "state-signal";
@@ -192,6 +199,20 @@ export interface DaemonStateSignalMessage {
   title?: string;
   /** For stop — optional trailing assistant text from the turn. */
   lastAssistantMessage?: string;
+  /** For stop-failure — Claude's error category (e.g. `rate_limit`, `server_error`). */
+  errorCode?: string;
+  /** For stop-failure — human-readable error detail. */
+  errorDetails?: string;
+  /** For tool-start / tool-end / tool-failure — Claude's tool name (e.g. `Read`, `Bash`). */
+  toolName?: string;
+  /** For tool-start / tool-end / tool-failure — id correlating start with end/failure. */
+  toolUseId?: string;
+  /** For tool-end / tool-failure / subagent-end — authoritative tool execution time from the hook. */
+  durationMs?: number;
+  /** For subagent-* — Claude's subagent identifier. */
+  agentId?: string;
+  /** For subagent-* — id of the Agent/Task tool_use that spawned this subagent (when known). */
+  parentToolUseId?: string;
 }
 
 export interface DaemonRestartMessage {
@@ -199,8 +220,28 @@ export interface DaemonRestartMessage {
   sessionKey: string;
 }
 
+/**
+ * PermissionRequest hook → daemon. Sent by `permission-hook.ts` when
+ * Claude Code asks the user to authorize a tool. Routed to the active
+ * session by Claude session UUID (not our internal sessionKey, which the
+ * hook subprocess can't see). The daemon holds the socket open until the
+ * user clicks Allow/Deny in Discord, then writes the decision JSON back.
+ */
+export interface DaemonPermissionRequestMessage {
+  type: "permission-request";
+  sessionId: string;
+  toolUseId: string;
+  toolName: string;
+  toolInput?: Record<string, unknown>;
+  permissionMode?: string;
+}
+
 export type DaemonToClient = PtyWriteMessage | DaemonReadyMessage | DaemonRestartMessage;
-export type ClientToDaemon = SessionInfoMessage | DaemonStateSignalMessage | SessionDisconnectMessage;
+export type ClientToDaemon =
+  | SessionInfoMessage
+  | DaemonStateSignalMessage
+  | SessionDisconnectMessage
+  | DaemonPermissionRequestMessage;
 
 // ── Named pipe messages (hook → rc) ──
 
@@ -237,6 +278,13 @@ export interface PipeStateSignalMessage {
   message?: string;
   title?: string;
   lastAssistantMessage?: string;
+  errorCode?: string;
+  errorDetails?: string;
+  toolName?: string;
+  toolUseId?: string;
+  durationMs?: number;
+  agentId?: string;
+  parentToolUseId?: string;
 }
 
 export type PipeMessage = PipeEnableMessage | PipeDisableMessage | PipeStatusMessage | PipeSessionRegisterMessage | PipeStateSignalMessage;
@@ -247,6 +295,7 @@ export type DiscordMessageType =
   | "user-prompt"
   | "assistant-text"
   | "tool-use"
+  | "tool-use-group"
   | "tool-result"
   | "tool-result-error"
   | "ask-user-question"
@@ -263,6 +312,10 @@ export interface ProcessedMessage {
   toolName?: string;
   toolUseId?: string;
   toolInput?: Record<string, unknown>;
+  /** Same-turn group: ids of every tool_use block folded into this group, in original order. */
+  toolUseIds?: string[];
+  /** Same-turn group: per-call tool inputs paired with toolUseIds. */
+  toolInputs?: Record<string, unknown>[];
   questions?: Array<{
     question: string;
     header: string;

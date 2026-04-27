@@ -3,11 +3,14 @@
 /**
  * Claude Code lifecycle hook — forwards deterministic state signals to rc.ts.
  * Registered against these hook events in settings.json:
- *   - Stop           → `stop`          (turn end; replaces idle-heuristic)
- *   - PostCompact    → `post-compact`  (context just got truncated)
- *   - PreCompact     → `pre-compact`   (context about to be truncated)
- *   - Notification   → `notification`  (permission prompt / elicitation / etc)
- *   - SessionEnd     → `session-end`   (clean exit, reason-distinguished)
+ *   - Stop           → `stop`             (turn end; replaces idle-heuristic)
+ *   - StopFailure    → `stop-failure`     (turn ended due to API error)
+ *   - PostCompact    → `post-compact`     (context just got truncated)
+ *   - PreCompact     → `pre-compact`      (context about to be truncated)
+ *   - Notification   → `notification`     (permission prompt / elicitation / etc)
+ *   - SessionEnd     → `session-end`      (clean exit, reason-distinguished)
+ *   - SubagentStart  → `subagent-start`   (Task/Agent subagent spawned)
+ *   - SubagentStop   → `subagent-end`     (subagent finished, includes duration)
  *
  * Only activates when CLAUDE_REMOTE_PIPE is set (by rc.ts).
  */
@@ -30,9 +33,17 @@ interface HookPayload {
   title?: string;
   // SessionEnd
   reason?: "clear" | "resume" | "logout" | "prompt_input_exit" | "other" | "bypass_permissions_disabled";
-  // Subagent metadata — we skip subagent-originated signals because they
-  // would double-fire alongside the main agent's own events.
+  // StopFailure — error code is one of: authentication_failed, billing_error,
+  // rate_limit, invalid_request, server_error, unknown
+  error?: string;
+  error_details?: string;
+  // Subagent metadata — for non-Subagent* events we skip when agent_id is set
+  // so subagent-originated signals don't double-fire alongside the main
+  // agent's own events. SubagentStart/SubagentStop carry agent_id by design.
   agent_id?: string;
+  parent_tool_use_id?: string;
+  duration_ms?: number;
+  is_error?: boolean;
 }
 
 async function main() {
@@ -55,12 +66,20 @@ async function main() {
 
   const event = payload.hook_event_name;
   if (!event) process.exit(0);
-  if (payload.agent_id) process.exit(0); // ignore subagent-originated signals
+
+  const isSubagentEvent = event === "SubagentStart" || event === "SubagentStop";
+  // Skip subagent-originated signals on the *main-thread* events, but pass
+  // through SubagentStart/SubagentStop where agent_id is the identifier we
+  // need.
+  if (!isSubagentEvent && payload.agent_id) process.exit(0);
 
   let mapped: StateSignalEvent | null = null;
   switch (event) {
     case "Stop":
       mapped = "stop";
+      break;
+    case "StopFailure":
+      mapped = "stop-failure";
       break;
     case "PostCompact":
       mapped = "post-compact";
@@ -73,6 +92,12 @@ async function main() {
       break;
     case "SessionEnd":
       mapped = "session-end";
+      break;
+    case "SubagentStart":
+      mapped = "subagent-start";
+      break;
+    case "SubagentStop":
+      mapped = payload.is_error ? "subagent-failure" : "subagent-end";
       break;
   }
 
@@ -89,6 +114,11 @@ async function main() {
       message: payload.message ?? payload.compact_summary,
       title: payload.title,
       lastAssistantMessage: payload.last_assistant_message,
+      errorCode: payload.error,
+      errorDetails: payload.error_details,
+      agentId: payload.agent_id,
+      parentToolUseId: payload.parent_tool_use_id,
+      durationMs: payload.duration_ms,
     });
   } catch {
     // best effort

@@ -146,6 +146,13 @@ function startPipeServer() {
             message: msg.message,
             title: msg.title,
             lastAssistantMessage: msg.lastAssistantMessage,
+            errorCode: msg.errorCode,
+            errorDetails: msg.errorDetails,
+            toolName: msg.toolName,
+            toolUseId: msg.toolUseId,
+            durationMs: msg.durationMs,
+            agentId: msg.agentId,
+            parentToolUseId: msg.parentToolUseId,
           });
           socket.write(JSON.stringify({ status: "ok" }));
         } else if (msg.type === "status") {
