@@ -1507,6 +1507,12 @@ async function handleStateSignal(session: Session, msg: Extract<ClientToDaemon, 
       // "✓ done" line on mobile without scrolling. Append a cost + context %
       // footer line so users can see token spend + capacity at a glance
       // without typing /cost or /context.
+      //
+      // Stop fires from a hook subprocess that races with chokidar's 100ms
+      // poll — the assistant.message.usage we need may not have flowed
+      // through handleFileChange yet. Force a synchronous flush so the
+      // accumulator is up to date before we read it.
+      try { await handleFileChange(session, session.jsonlPath); } catch { /* best effort */ }
       const last = msg.lastAssistantMessage?.trim();
       const u = session.totalUsage;
       const haveUsage = u.input > 0 || u.output > 0;
