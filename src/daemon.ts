@@ -1502,43 +1502,36 @@ async function handleStateSignal(session: Session, msg: Extract<ClientToDaemon, 
       break;
     }
     case "stop": {
-      // Turn finished. The transcript already has the assistant text; the
-      // hook's last_assistant_message is a convenience for surfacing a clean
-      // "✓ done" line on mobile without scrolling. Append a cost + context %
-      // footer line so users can see token spend + capacity at a glance
-      // without typing /cost or /context.
+      // Turn finished. Render a token + cost + context-% footer so users see
+      // spend + capacity at a glance without typing /cost or /context. The
+      // last_assistant_message from the hook is intentionally NOT surfaced —
+      // it duplicates the JSONL-rendered assistant text we already posted.
       //
       // Stop fires from a hook subprocess that races with chokidar's 100ms
       // poll — the assistant.message.usage we need may not have flowed
       // through handleFileChange yet. Force a synchronous flush so the
       // accumulator is up to date before we read it.
       try { await handleFileChange(session, session.jsonlPath); } catch { /* best effort */ }
-      const last = msg.lastAssistantMessage?.trim();
       const u = session.totalUsage;
       const haveUsage = u.input > 0 || u.output > 0;
-      let body = "";
-      if (last && last.length > 0) body += `✓ ${truncate(last, 200)}\n`;
       if (haveUsage) {
         const cacheTotal = u.cacheRead + u.cacheCreate;
         const cachePct = cacheTotal + u.input > 0
           ? Math.round((u.cacheRead / (cacheTotal + u.input)) * 100)
           : 0;
         const ctxPct = (session.lastInputTokens / DEFAULT_CONTEXT_WINDOW) * 100;
-        const ctx = renderContextBar(ctxPct);
+        const ctxBar = renderContextBar(ctxPct);
         const parts = [
           `${formatTokens(u.input)} in`,
           `${formatTokens(u.output)} out`,
         ];
         if (cacheTotal > 0) parts.push(`cache ${cachePct}%`);
         parts.push(formatUSD(u.cost));
-        parts.push(ctx.bar);
-        body += `*${parts.join(" · ")}*`;
-      }
-      if (body) {
+        parts.push(ctxBar.bar);
         await ctx.provider.send({
           embed: {
-            description: body,
-            color: haveUsage ? renderContextBar(session.lastInputTokens / DEFAULT_CONTEXT_WINDOW * 100).color : COLOR.SYSTEM,
+            description: `*${parts.join(" · ")}*`,
+            color: ctxBar.color,
           },
         });
       }
