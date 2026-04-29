@@ -84,6 +84,7 @@ Once connected, you get slash commands in the channel:
 | `/key <keys>` | Send raw keypresses (e.g. `enter`, `up down enter`, `ctrl+c`) |
 | `/queue view\|clear\|remove\|edit` | Manage queued messages |
 | `/cleanup days:<N>` | Preview + delete inactive session channels older than N days |
+| `/launch path:<dir>` | Open a new Windows Terminal tab running `claude-remote --remote` in `<dir>` (autocompletes from recent projects) |
 
 You can also just type in the channel to send messages to Claude, or attach images.
 

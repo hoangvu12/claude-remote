@@ -16,11 +16,12 @@ import {
 } from "discord.js";
 import fsp from "node:fs/promises";
 import path from "node:path";
+import { spawn } from "node:child_process";
 import type { DiscordProvider } from "./providers/discord.js";
 import type { SessionContext } from "./handler.js";
 import type { PtyWriteMessage } from "./types.js";
 import { ActivityManager, STATUS_LABELS, type ActivityState } from "./activity.js";
-import { modeShiftTabCount, getModeCycle, isModeReachable, MODE_LABELS, ID_PREFIX, SESSIONS_FILE, encodeProjectPath, getClaudeDir, truncate, plural } from "./utils.js";
+import { modeShiftTabCount, getModeCycle, isModeReachable, MODE_LABELS, ID_PREFIX, SESSIONS_FILE, encodeProjectPath, getClaudeDir, truncate, plural, readLaunchedProjects, recordLaunchedProject, scanClaudeProjectCwds } from "./utils.js";
 import { COLOR } from "./discord-renderer.js";
 
 const RESUME_PICK_PREFIX = "resume-pick:";
@@ -209,7 +210,19 @@ export async function setupSlashCommands(
           .setMinValue(1)
           .setMaxValue(365)
       ),
+    new SlashCommandBuilder()
+      .setName("launch")
+      .setDescription("Open a new Windows Terminal tab with claude-remote in a project")
+      .addStringOption((opt) =>
+        opt.setName("path")
+          .setDescription("Project path — autocompletes from recently launched projects")
+          .setRequired(true)
+          .setAutocomplete(true)
+      ),
   ];
+
+  // Record this session's project so /launch autocomplete can suggest it later.
+  recordLaunchedProject(deps.projectDir);
 
   if (!skipRegistration) {
     try {
@@ -223,6 +236,38 @@ export async function setupSlashCommands(
 
   const handler = async (interaction: import("discord.js").Interaction) => {
     if (interaction.channelId !== deps.channelId) return;
+
+    if (interaction.isAutocomplete() && interaction.commandName === "launch") {
+      const focused = interaction.options.getFocused(true);
+      if (focused.name !== "path") return;
+      const query = focused.value.toLowerCase();
+
+      // Merge: explicitly-launched projects (with their lastUsed) + Claude's
+      // own ~/.claude/projects/* (sorted by JSONL mtime). Registry's lastUsed
+      // wins on collision so just-launched paths surface to the top.
+      const merged = new Map<string, number>();
+      for (const s of scanClaudeProjectCwds()) merged.set(s.path, s.mtimeMs);
+      for (const r of readLaunchedProjects()) {
+        merged.set(r.path, Math.max(merged.get(r.path) ?? 0, r.lastUsed));
+      }
+
+      const choices = Array.from(merged.entries())
+        .filter(([p]) => {
+          if (!query) return true;
+          return p.toLowerCase().includes(query) || path.basename(p).toLowerCase().includes(query);
+        })
+        .sort((a, b) => b[1] - a[1])
+        .slice(0, 25)
+        .map(([p]) => ({
+          name: truncate(`${path.basename(p)} — ${p}`, 100),
+          value: truncate(p, 100),
+        }));
+
+      try {
+        await interaction.respond(choices);
+      } catch { /* interaction may have expired */ }
+      return;
+    }
 
     if (interaction.isButton()) {
       if (interaction.customId.startsWith(ID_PREFIX.CLEANUP_CONFIRM)) {
@@ -451,11 +496,73 @@ export async function setupSlashCommands(
       case "cleanup":
         await handleCleanupPreview(cmd, deps);
         break;
+      case "launch":
+        await handleLaunch(cmd);
+        break;
     }
   };
 
   client.on(Events.InteractionCreate, handler);
   return () => client.removeListener(Events.InteractionCreate, handler);
+}
+
+// ── /launch ──
+//
+// Spawns `wt.exe -w 0 nt -d <path> --title <basename> claude-remote --remote`
+// detached. `-w 0` reuses the most recently used Windows Terminal window if
+// one exists, otherwise creates a new one. Validation happens before the
+// spawn so we can reply with a clear error in the same channel; the new tab's
+// own daemon will open its own session channel once it boots.
+async function handleLaunch(cmd: ChatInputCommandInteraction): Promise<void> {
+  const raw = cmd.options.getString("path", true).trim();
+  if (!raw) {
+    await cmd.reply({ content: "❌ Path is required.", ephemeral: true });
+    return;
+  }
+  const resolved = path.resolve(raw);
+
+  let isDir = false;
+  try {
+    const stat = await fsp.stat(resolved);
+    isDir = stat.isDirectory();
+  } catch {
+    await cmd.reply({ content: `❌ Path not found: \`${resolved}\``, ephemeral: true });
+    return;
+  }
+  if (!isDir) {
+    await cmd.reply({ content: `❌ Not a directory: \`${resolved}\``, ephemeral: true });
+    return;
+  }
+
+  await cmd.deferReply({ ephemeral: true });
+
+  const name = path.basename(resolved) || "claude-remote";
+  // Wrap in `cmd /k` because wt.exe's commandline goes through CreateProcess,
+  // which doesn't apply PATHEXT — npm-installed `.cmd` shims like
+  // `claude-remote.cmd` only resolve through a real shell. /k keeps the tab
+  // open so any startup error stays visible instead of vanishing.
+  const args = ["-w", "0", "nt", "-d", resolved, "--title", name, "cmd", "/k", "claude-remote", "--remote"];
+
+  try {
+    const proc = spawn("wt.exe", args, { detached: true, stdio: "ignore", windowsHide: false });
+    proc.on("error", async (err) => {
+      try {
+        await cmd.editReply({ content: `❌ Failed to launch Windows Terminal: ${err.message}` });
+      } catch { /* reply window may have closed */ }
+    });
+    proc.unref();
+    recordLaunchedProject(resolved);
+    await cmd.editReply({
+      content: [
+        `🚀 Launching \`${name}\` in a new tab.`,
+        `\`${resolved}\``,
+        `A new Discord channel will appear once the session connects.`,
+      ].join("\n"),
+    });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    await cmd.editReply({ content: `❌ Failed to spawn wt.exe: ${msg}` });
+  }
 }
 
 // ── Recent-sessions picker for /resume ──

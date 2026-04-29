@@ -60,6 +60,127 @@ export const ID_PREFIX = {
 
 export const SESSIONS_FILE = path.join(CONFIG_DIR, "sessions.json");
 
+// ── /launch project registry ──
+//
+// /launch lets you spawn a new claude-remote tab on the host from Discord.
+// Autocomplete needs a list of recently-used project dirs to suggest, but
+// Claude's own ~/.claude/projects/ directory uses a lossy encoding (drive
+// colons and path separators all collapse to dashes), so we can't reliably
+// round-trip those back to absolute paths. Instead we keep our own list:
+// every active session writes its projectDir here on daemon startup.
+
+export const LAUNCHED_PROJECTS_FILE = path.join(CONFIG_DIR, "launched-projects.json");
+
+interface LaunchedProject {
+  path: string;
+  lastUsed: number;
+}
+
+const MAX_LAUNCHED_PROJECTS = 50;
+const LAUNCHED_DEDUPE_WINDOW_MS = 60_000;
+
+export function readLaunchedProjects(): LaunchedProject[] {
+  try {
+    const data = JSON.parse(fs.readFileSync(LAUNCHED_PROJECTS_FILE, "utf-8")) as LaunchedProject[];
+    return Array.isArray(data) ? data : [];
+  } catch {
+    return [];
+  }
+}
+
+export function recordLaunchedProject(projectPath: string): void {
+  const norm = path.resolve(projectPath);
+  const existing = readLaunchedProjects();
+  // Skip the rewrite if this path is already at the head and was touched
+  // recently — daemon startup calls this on every boot.
+  const head = existing[0];
+  if (head?.path === norm && Date.now() - head.lastUsed < LAUNCHED_DEDUPE_WINDOW_MS) return;
+  const updated = [{ path: norm, lastUsed: Date.now() }, ...existing.filter((p) => p.path !== norm)]
+    .slice(0, MAX_LAUNCHED_PROJECTS);
+  try {
+    fs.mkdirSync(path.dirname(LAUNCHED_PROJECTS_FILE), { recursive: true });
+    fs.writeFileSync(LAUNCHED_PROJECTS_FILE, JSON.stringify(updated, null, 2) + "\n");
+  } catch { /* best effort */ }
+}
+
+// Discovers project dirs from Claude's own ~/.claude/projects/*. The folder
+// names are encoded (lossy: colons + separators all become dashes), so we
+// recover the real path from each transcript's `cwd` field. Cached briefly
+// because autocomplete fires on every keystroke.
+
+interface ClaudeProjectCwd {
+  path: string;
+  mtimeMs: number;
+}
+
+let scanCache: { ts: number; result: ClaudeProjectCwd[] } | null = null;
+const SCAN_TTL_MS = 60_000;
+
+export function scanClaudeProjectCwds(): ClaudeProjectCwd[] {
+  if (scanCache && Date.now() - scanCache.ts < SCAN_TTL_MS) return scanCache.result;
+
+  const projectsDir = path.join(getClaudeDir(), "projects");
+  let dirs: string[];
+  try {
+    dirs = fs.readdirSync(projectsDir);
+  } catch {
+    scanCache = { ts: Date.now(), result: [] };
+    return [];
+  }
+
+  const found = new Map<string, number>();
+  for (const d of dirs) {
+    const full = path.join(projectsDir, d);
+    let entries: fs.Dirent[];
+    try {
+      entries = fs.readdirSync(full, { withFileTypes: true });
+    } catch { continue; }
+
+    let best: { path: string; mtimeMs: number } | null = null;
+    for (const e of entries) {
+      if (!e.isFile() || !e.name.endsWith(".jsonl")) continue;
+      const filePath = path.join(full, e.name);
+      try {
+        const stat = fs.statSync(filePath);
+        if (stat.size === 0) continue;
+        if (!best || stat.mtimeMs > best.mtimeMs) best = { path: filePath, mtimeMs: stat.mtimeMs };
+      } catch { /* skip */ }
+    }
+    if (!best) continue;
+
+    let cwd = "";
+    try {
+      const fd = fs.openSync(best.path, "r");
+      try {
+        const buf = Buffer.alloc(64 * 1024);
+        const bytesRead = fs.readSync(fd, buf, 0, buf.length, 0);
+        const text = buf.subarray(0, bytesRead).toString("utf-8");
+        for (const line of text.split("\n")) {
+          if (!line) continue;
+          try {
+            const msg = JSON.parse(line) as { cwd?: unknown };
+            if (typeof msg.cwd === "string" && msg.cwd) { cwd = msg.cwd; break; }
+          } catch { /* malformed line — keep scanning */ }
+        }
+      } finally {
+        fs.closeSync(fd);
+      }
+    } catch { continue; }
+
+    if (!cwd) continue;
+    const norm = path.resolve(cwd);
+    const prev = found.get(norm);
+    if (prev === undefined || best.mtimeMs > prev) found.set(norm, best.mtimeMs);
+  }
+
+  const result = Array.from(found.entries())
+    .map(([p, mtimeMs]) => ({ path: p, mtimeMs }))
+    .sort((a, b) => b.mtimeMs - a.mtimeMs);
+
+  scanCache = { ts: Date.now(), result };
+  return result;
+}
+
 /** Path of the per-rc-pid statusline snapshot. statusline.ts is the only
  *  place that has Claude Code's authoritative cost/context-window numbers,
  *  so it drops them here for the daemon to consume on Stop. */
