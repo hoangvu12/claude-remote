@@ -10,7 +10,7 @@
 
 import fs from "node:fs";
 import path from "node:path";
-import { STATUS_FLAG, CONFIG_DIR } from "./utils.js";
+import { STATUS_FLAG, CONFIG_DIR, statuslineSnapshotPath, type StatuslineSnapshot } from "./utils.js";
 
 /**
  * Shape of `buildStatusLineCommandInput` from upstream (components/StatusLine.tsx).
@@ -75,10 +75,11 @@ process.stdin.on("end", () => {
   // CLAUDE_REMOTE_PIPE is only set when running under claude-remote (rc.ts).
   // Its format is \\.\pipe\claude-remote-{pid}, so extract the rc PID from it.
   let isActive = false;
+  let rcPid: number | null = null;
   const pipeName = process.env.CLAUDE_REMOTE_PIPE;
   if (pipeName) {
     const rcPidMatch = pipeName.match(/claude-remote-(\d+)$/);
-    const rcPid = rcPidMatch ? parseInt(rcPidMatch[1], 10) : null;
+    rcPid = rcPidMatch ? parseInt(rcPidMatch[1], 10) : null;
     try {
       const flagPid = parseInt(fs.readFileSync(STATUS_FLAG, "utf-8").trim(), 10);
       if (flagPid && rcPid && flagPid === rcPid) {
@@ -89,6 +90,23 @@ process.stdin.on("end", () => {
       // File missing or PID dead — clean up stale flag
       try { fs.unlinkSync(STATUS_FLAG); } catch { /* already gone */ }
     }
+  }
+
+  // Drop a snapshot of Claude's authoritative session metrics so the daemon
+  // can render them in the Stop footer. statusline is the only place these
+  // numbers exist outside Claude itself — JSONL-derived totals reset every
+  // /new and don't carry the [1m] context-window flag.
+  if (rcPid && isActive) {
+    const snapshot: StatuslineSnapshot = {
+      ts: Date.now(),
+      totalCostUsd: session.cost?.total_cost_usd,
+      usedPercentage: session.context_window?.used_percentage,
+      contextWindowSize: session.context_window?.context_window_size,
+      exceeds200k,
+    };
+    try {
+      fs.writeFileSync(statuslineSnapshotPath(rcPid), JSON.stringify(snapshot));
+    } catch { /* best effort */ }
   }
   const rcStatus = isActive
     ? "\x1b[32m● On\x1b[0m"   // green dot

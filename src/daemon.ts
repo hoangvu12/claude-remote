@@ -7,7 +7,7 @@ import os from "node:os";
 import net from "node:net";
 import { parseJSONLString, processAssistantBlocks, processUserBlocks, processNonConversation, walkCurrentBranch, getToolInputPreview } from "./jsonl-parser.js";
 import { renderBatch, COLOR } from "./discord-renderer.js";
-import { resolveJSONLPath, ID_PREFIX, CONFIG_DIR, DAEMON_PIPE_NAME, SESSIONS_FILE, capSet, truncate, extractToolResultText, extractToolResultImages, mimeToExt, isLocalCommand, safeUnlink, createLineParser } from "./utils.js";
+import { resolveJSONLPath, ID_PREFIX, CONFIG_DIR, DAEMON_PIPE_NAME, SESSIONS_FILE, statuslineSnapshotPath, type StatuslineSnapshot, capSet, truncate, extractToolResultText, extractToolResultImages, mimeToExt, isLocalCommand, safeUnlink, createLineParser } from "./utils.js";
 import type { JSONLMessage, ProcessedMessage, ContentBlock, ContentBlockToolUse, ContentBlockText, ContentBlockToolResult, DaemonToClient, ClientToDaemon, PtyWriteMessage } from "./types.js";
 import { DiscordProvider } from "./providers/discord.js";
 import { createPipeline } from "./create-pipeline.js";
@@ -159,6 +159,25 @@ function saveSessionChannel(sid: string, channelId: string): void {
     fs.mkdirSync(path.dirname(SESSIONS_FILE), { recursive: true });
     fs.writeFileSync(SESSIONS_FILE, JSON.stringify(data, null, 2) + "\n");
   } catch { /* best effort */ }
+}
+
+const STATUSLINE_FRESH_MS = 30_000;
+
+/** Read the per-rc-pid statusline snapshot, returning null if missing or
+ *  older than STATUSLINE_FRESH_MS. The rc pid is encoded in sessionKey
+ *  (`rc-{pid}`). */
+function readStatuslineSnapshot(sessionKey: string): StatuslineSnapshot | null {
+  const m = sessionKey.match(/^rc-(\d+)$/);
+  if (!m) return null;
+  const rcPid = parseInt(m[1], 10);
+  try {
+    const raw = fs.readFileSync(statuslineSnapshotPath(rcPid), "utf-8");
+    const snap = JSON.parse(raw) as StatuslineSnapshot;
+    if (Date.now() - snap.ts > STATUSLINE_FRESH_MS) return null;
+    return snap;
+  } catch {
+    return null;
+  }
 }
 
 // ── Multi-question helpers (per-session) ──
@@ -1528,22 +1547,28 @@ async function handleStateSignal(session: Session, msg: Extract<ClientToDaemon, 
         const cachePct = cacheTotal + u.input > 0
           ? Math.round((u.cacheRead / (cacheTotal + u.input)) * 100)
           : 0;
-        // Pick the context window: explicit [1m] suffix wins, else infer
-        // from observed usage. JSONL strips the [1m] suffix from `model`,
-        // so an Opus 4.7 [1m] turn shows up as plain `claude-opus-4-7`. If
-        // we've already observed >200k tokens without an auto-compact, the
-        // model must be ≥1M-context — fall back to 1M to avoid pegging the
-        // bar at 100% for users on 1M-capable models.
-        const declared = getContextWindowForModel(session.lastModel);
-        const ctxWindow = session.lastInputTokens > declared ? 1_000_000 : declared;
-        const ctxPct = (session.lastInputTokens / ctxWindow) * 100;
+
+        // Prefer Claude Code's authoritative cost + context % from the
+        // statusline snapshot. JSONL-derived numbers reset every /new and
+        // don't know about the [1m] context-window flag (Claude strips it
+        // before logging the model id).
+        const snap = readStatuslineSnapshot(session.sessionKey);
+        const cost = snap?.totalCostUsd ?? u.cost;
+        let ctxPct: number;
+        if (snap?.usedPercentage !== undefined) {
+          ctxPct = snap.usedPercentage;
+        } else {
+          const declared = getContextWindowForModel(session.lastModel);
+          const ctxWindow = session.lastInputTokens > declared ? 1_000_000 : declared;
+          ctxPct = (session.lastInputTokens / ctxWindow) * 100;
+        }
         const ctxBar = renderContextBar(ctxPct);
         const parts = [
           `${formatTokens(u.input)} in`,
           `${formatTokens(u.output)} out`,
         ];
         if (cacheTotal > 0) parts.push(`cache ${cachePct}%`);
-        parts.push(formatUSD(u.cost));
+        parts.push(formatUSD(cost));
         parts.push(ctxBar.bar);
         await ctx.provider.send({ text: `-# ${parts.join(" · ")}` });
       }

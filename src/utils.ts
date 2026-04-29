@@ -60,6 +60,24 @@ export const ID_PREFIX = {
 
 export const SESSIONS_FILE = path.join(CONFIG_DIR, "sessions.json");
 
+/** Path of the per-rc-pid statusline snapshot. statusline.ts is the only
+ *  place that has Claude Code's authoritative cost/context-window numbers,
+ *  so it drops them here for the daemon to consume on Stop. */
+export function statuslineSnapshotPath(rcPid: number): string {
+  return path.join(CONFIG_DIR, `statusline-${rcPid}.json`);
+}
+
+export interface StatuslineSnapshot {
+  /** epoch ms when statusline.ts wrote this file */
+  ts: number;
+  /** authoritative session cost from Claude Code itself */
+  totalCostUsd?: number;
+  /** authoritative context-window % from Claude Code itself */
+  usedPercentage?: number;
+  contextWindowSize?: number;
+  exceeds200k?: boolean;
+}
+
 // ── Helpers ──
 
 export function encodeProjectPath(projectPath: string): string {
