@@ -76,6 +76,15 @@ export interface StatuslineSnapshot {
   usedPercentage?: number;
   contextWindowSize?: number;
   exceeds200k?: boolean;
+  modelDisplay?: string;
+  permissionMode?: string;
+  /** 5-hour rate-limit bucket — only present on plans that report limits. */
+  fiveHourPct?: number;
+  /** Reset time in unix epoch seconds (matches upstream's RawWindowUtilization). */
+  fiveHourResetsAt?: number;
+  /** Weekly rate-limit bucket — same caveat as five-hour. */
+  weeklyPct?: number;
+  weeklyResetsAt?: number;
 }
 
 // ── Helpers ──

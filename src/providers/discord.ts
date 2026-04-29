@@ -351,4 +351,23 @@ export class DiscordProvider implements OutputProvider, ThreadCapable, InputCapa
       }
     } catch { /* no threads to clean */ }
   }
+
+  /** Find a pinned message by this bot whose first embed title starts with
+   *  `titlePrefix`. Used by the session-status board to recover its message
+   *  id across daemon restarts so we edit instead of stacking new pins. */
+  async findPinnedBoard(titlePrefix: string): Promise<ProviderMessage | null> {
+    try {
+      const pinned = await this.channel.messages.fetchPinned();
+      const me = this.client.user?.id;
+      for (const [, m] of pinned) {
+        if (m.author.id !== me) continue;
+        const t = m.embeds[0]?.title ?? "";
+        if (t.startsWith(titlePrefix)) {
+          this.messageCache.set(m.id, m);
+          return { id: m.id };
+        }
+      }
+    } catch { /* no permission or empty */ }
+    return null;
+  }
 }

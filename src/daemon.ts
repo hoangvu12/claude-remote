@@ -20,6 +20,7 @@ import { closePassiveGroup } from "./handlers/passive-tools.js";
 import { closeAllMcpGroups } from "./handlers/mcp-tools.js";
 import { startSubagentWatcher, flushAndStopSubagentWatcher, stopAllSubagentWatchersForSession } from "./subagent-watcher.js";
 import { ActivityManager } from "./activity.js";
+import { createBoardState, maybeUpdateBoard, type BoardState } from "./session-board.js";
 import { setupSlashCommands } from "./slash-commands.js";
 import { ensureHooksInstalled } from "./install-hooks.js";
 import { calculateUSDCost, formatTokens, formatUSD, renderContextBar, getContextWindowForModel } from "./cost.js";
@@ -99,6 +100,8 @@ interface Session {
   /** Last seen model id — falls back to default for cost computation when
    *  JSONL doesn't tag a turn. */
   lastModel: string | null;
+  /** Pinned-message board: model/mode/rate-limits/cost/ctx. Updated on Stop. */
+  board: BoardState;
 }
 
 // ── Daemon-level state ──
@@ -1393,6 +1396,7 @@ async function createSession(msg: ClientToDaemon & { type: "session-info" }, soc
     lastInputTokens: 0,
     initiatorUserId: null,
     lastModel: null,
+    board: createBoardState(),
   };
 
   sessions.set(sessionKey, session);
@@ -1571,6 +1575,10 @@ async function handleStateSignal(session: Session, msg: Extract<ClientToDaemon, 
         parts.push(formatUSD(cost));
         parts.push(ctxBar.bar);
         await ctx.provider.send({ text: `-# ${parts.join(" · ")}` });
+
+        if (snap) {
+          maybeUpdateBoard(session.provider, session.board, snap).catch(() => {});
+        }
       }
       activity.transitionToIdle();
       break;

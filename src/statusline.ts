@@ -44,8 +44,10 @@ interface SessionData {
   };
   exceeds_200k_tokens?: boolean;
   rate_limits?: {
-    five_hour?: { used_percentage?: number; resets_at?: string };
-    seven_day?: { used_percentage?: number; resets_at?: string };
+    // resets_at is unix epoch seconds (RawWindowUtilization in upstream
+    // services/claudeAiLimits.ts), not ISO — Date.parse won't decode it.
+    five_hour?: { used_percentage?: number; resets_at?: number };
+    seven_day?: { used_percentage?: number; resets_at?: number };
   };
   vim?: { mode?: string };
   agent?: { name?: string };
@@ -103,6 +105,12 @@ process.stdin.on("end", () => {
       usedPercentage: session.context_window?.used_percentage,
       contextWindowSize: session.context_window?.context_window_size,
       exceeds200k,
+      modelDisplay: session.model?.display_name,
+      permissionMode: session.permission_mode,
+      fiveHourPct: session.rate_limits?.five_hour?.used_percentage,
+      fiveHourResetsAt: session.rate_limits?.five_hour?.resets_at,
+      weeklyPct: session.rate_limits?.seven_day?.used_percentage,
+      weeklyResetsAt: session.rate_limits?.seven_day?.resets_at,
     };
     try {
       fs.writeFileSync(statuslineSnapshotPath(rcPid), JSON.stringify(snapshot));
