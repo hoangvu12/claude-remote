@@ -7,7 +7,7 @@ import os from "node:os";
 import net from "node:net";
 import { parseJSONLString, processAssistantBlocks, processUserBlocks, processNonConversation, walkCurrentBranch, getToolInputPreview } from "./jsonl-parser.js";
 import { renderBatch, COLOR } from "./discord-renderer.js";
-import { resolveJSONLPath, ID_PREFIX, CONFIG_DIR, DAEMON_PIPE_NAME, capSet, truncate, extractToolResultText, extractToolResultImages, mimeToExt, isLocalCommand, safeUnlink, createLineParser } from "./utils.js";
+import { resolveJSONLPath, ID_PREFIX, CONFIG_DIR, DAEMON_PIPE_NAME, SESSIONS_FILE, capSet, truncate, extractToolResultText, extractToolResultImages, mimeToExt, isLocalCommand, safeUnlink, createLineParser } from "./utils.js";
 import type { JSONLMessage, ProcessedMessage, ContentBlock, ContentBlockToolUse, ContentBlockText, ContentBlockToolResult, DaemonToClient, ClientToDaemon, PtyWriteMessage } from "./types.js";
 import { DiscordProvider } from "./providers/discord.js";
 import { createPipeline } from "./create-pipeline.js";
@@ -26,7 +26,6 @@ import { calculateUSDCost, formatTokens, formatUSD, renderContextBar, getContext
 
 // ── Constants ──
 
-const SESSIONS_FILE = path.join(CONFIG_DIR, "sessions.json");
 const RELOAD_EXIT_CODE = 42;
 const BATCH_DELAY = 600;
 const KEY_DELAY = 150;
@@ -1400,6 +1399,8 @@ async function createSession(msg: ClientToDaemon & { type: "session-info" }, soc
     projectDir,
     sessionId,
     channelId: channel.id,
+    categoryId,
+    isChannelActive: (id) => channelToSessionKey.has(id),
   }, commandsRegistered);
   commandsRegistered = true;
 

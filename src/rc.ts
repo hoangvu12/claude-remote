@@ -144,7 +144,12 @@ function startPipeServer() {
           if (msg.cwd) projectDir = msg.cwd;
           sessionSource = msg.source;
 
-          if (daemonWasEnabled && oldSessionId && oldSessionId !== sessionId) {
+          // Reconnect when the daemon's session info is stale. Includes the
+          // /new path: restartClaude(null) nulls oldSessionId before spawn,
+          // so without the explicit null check the daemon stays glued to the
+          // old JSONL — Stop hooks still fire (cost footer renders) but no
+          // transcript content reaches Discord.
+          if (daemonWasEnabled && oldSessionId !== sessionId) {
             disconnectDaemon();
             connectToDaemon();
           }

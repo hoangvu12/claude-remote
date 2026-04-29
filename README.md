@@ -83,6 +83,7 @@ Once connected, you get slash commands in the channel:
 | `/model <model>` | Switch Claude model (sonnet/opus/haiku) |
 | `/key <keys>` | Send raw keypresses (e.g. `enter`, `up down enter`, `ctrl+c`) |
 | `/queue view\|clear\|remove\|edit` | Manage queued messages |
+| `/cleanup days:<N>` | Preview + delete inactive session channels older than N days |
 
 You can also just type in the channel to send messages to Claude, or attach images.
 

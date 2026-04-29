@@ -4,10 +4,15 @@ import {
   TextInputBuilder,
   TextInputStyle,
   ActionRowBuilder,
+  ButtonBuilder,
+  ButtonStyle,
   StringSelectMenuBuilder,
+  ChannelType,
   Events,
   type Client,
   type ChatInputCommandInteraction,
+  type TextChannel,
+  type ButtonInteraction,
 } from "discord.js";
 import fsp from "node:fs/promises";
 import path from "node:path";
@@ -15,10 +20,23 @@ import type { DiscordProvider } from "./providers/discord.js";
 import type { SessionContext } from "./handler.js";
 import type { PtyWriteMessage } from "./types.js";
 import { ActivityManager, STATUS_LABELS, type ActivityState } from "./activity.js";
-import { modeShiftTabCount, getModeCycle, isModeReachable, MODE_LABELS, ID_PREFIX, encodeProjectPath, getClaudeDir, truncate } from "./utils.js";
+import { modeShiftTabCount, getModeCycle, isModeReachable, MODE_LABELS, ID_PREFIX, SESSIONS_FILE, encodeProjectPath, getClaudeDir, truncate, plural } from "./utils.js";
 import { COLOR } from "./discord-renderer.js";
 
 const RESUME_PICK_PREFIX = "resume-pick:";
+
+// Pending /cleanup previews keyed by interaction id, expire after CLEANUP_TTL.
+// Held server-side because Discord customId caps at 100 chars (snowflakes are
+// ~19 each, so we couldn't fit a meaningful list inline).
+interface PendingCleanup {
+  channelIds: string[];
+  invokerUserId: string;
+  expiresAt: number;
+}
+const pendingCleanups = new Map<string, PendingCleanup>();
+const CLEANUP_TTL = 5 * 60 * 1000;
+const CLEANUP_PREVIEW_LIMIT = 15;
+const CLEANUP_PROGRESS_EVERY = 3;
 
 export interface SlashCommandDeps {
   getCtx: () => SessionContext | null;
@@ -35,6 +53,12 @@ export interface SlashCommandDeps {
   projectDir: string;
   sessionId: string;
   channelId: string;
+  /** Discord category that holds all session channels — `/cleanup` scopes to it. */
+  categoryId: string;
+  /** True if the channel currently has a live session attached. Cleanup
+   *  must skip these so we don't yank the channel out from under a running
+   *  daemon. */
+  isChannelActive: (channelId: string) => boolean;
 }
 
 /** Returns a cleanup function that removes the InteractionCreate listener */
@@ -175,6 +199,16 @@ export async function setupSlashCommands(
     new SlashCommandBuilder()
       .setName("kill-agents")
       .setDescription("Kill all running background subagents"),
+    new SlashCommandBuilder()
+      .setName("cleanup")
+      .setDescription("Delete inactive session channels older than N days")
+      .addIntegerOption((opt) =>
+        opt.setName("days")
+          .setDescription("Channels with no activity for at least this many days")
+          .setRequired(true)
+          .setMinValue(1)
+          .setMaxValue(365)
+      ),
   ];
 
   if (!skipRegistration) {
@@ -189,6 +223,17 @@ export async function setupSlashCommands(
 
   const handler = async (interaction: import("discord.js").Interaction) => {
     if (interaction.channelId !== deps.channelId) return;
+
+    if (interaction.isButton()) {
+      if (interaction.customId.startsWith(ID_PREFIX.CLEANUP_CONFIRM)) {
+        await handleCleanupConfirm(interaction, deps);
+        return;
+      }
+      if (interaction.customId.startsWith(ID_PREFIX.CLEANUP_CANCEL)) {
+        await handleCleanupCancel(interaction);
+        return;
+      }
+    }
 
     if (interaction.isStringSelectMenu() && interaction.customId.startsWith(RESUME_PICK_PREFIX)) {
       const target = interaction.values[0];
@@ -402,6 +447,9 @@ export async function setupSlashCommands(
         sendToClient({ type: "pty-write", text: "\x18", raw: true });
         setTimeout(() => sendToClient({ type: "pty-write", text: "\x0b", raw: true }), 100);
         await cmd.reply({ content: "🗡️ Kill-agents chord sent", ephemeral: true });
+        break;
+      case "cleanup":
+        await handleCleanupPreview(cmd, deps);
         break;
     }
   };
@@ -683,4 +731,194 @@ async function handleQueueCommand(cmd: ChatInputCommandInteraction, deps: SlashC
       break;
     }
   }
+}
+
+// ── /cleanup ──
+
+const DISCORD_EPOCH = 1420070400000n;
+
+function snowflakeTimestamp(snowflake: string): number {
+  return Number((BigInt(snowflake) >> 22n) + DISCORD_EPOCH);
+}
+
+function cleanupEmbed(deleted: number, total: number, failed: number, done: boolean) {
+  const failPart = failed ? ` · ${failed} failed` : "";
+  return {
+    title: done ? "✅ Cleanup complete" : "🧹 Cleaning up…",
+    description: `Deleted ${deleted}/${total}${failPart}`,
+    color: COLOR.BLURPLE,
+  };
+}
+
+async function handleCleanupPreview(cmd: ChatInputCommandInteraction, deps: SlashCommandDeps) {
+  const days = cmd.options.getInteger("days", true);
+  const cutoff = Date.now() - days * 24 * 60 * 60 * 1000;
+
+  if (!deps.categoryId) {
+    await cmd.reply({ content: "⚠️ No category configured — can't scope the cleanup.", ephemeral: true });
+    return;
+  }
+
+  const guild = cmd.guild;
+  if (!guild) return;
+
+  const candidates: Array<{ ch: TextChannel; lastActivity: number }> = [];
+  let activeSkip = 0;
+  for (const [, ch] of guild.channels.cache) {
+    if (ch.type !== ChannelType.GuildText) continue;
+    if (ch.parentId !== deps.categoryId) continue;
+    if (ch.id === deps.channelId) continue;
+    if (deps.isChannelActive(ch.id)) { activeSkip++; continue; }
+    const text = ch as TextChannel;
+    const lastActivity = text.lastMessageId
+      ? snowflakeTimestamp(text.lastMessageId)
+      : (text.createdTimestamp ?? Date.now());
+    if (lastActivity > cutoff) continue;
+    candidates.push({ ch: text, lastActivity });
+  }
+
+  if (candidates.length === 0) {
+    const note = activeSkip > 0 ? ` (${plural(activeSkip, "active session")} skipped)` : "";
+    await cmd.reply({
+      content: `🧹 Nothing to clean up — no channels older than ${plural(days, "day")}${note}.`,
+      ephemeral: true,
+    });
+    return;
+  }
+
+  candidates.sort((a, b) => a.lastActivity - b.lastActivity);
+
+  const previewLines = candidates.slice(0, CLEANUP_PREVIEW_LIMIT).map(({ ch, lastActivity }) =>
+    `• #${ch.name} — ${formatRelativeTime(lastActivity)}`
+  );
+  if (candidates.length > CLEANUP_PREVIEW_LIMIT) {
+    previewLines.push(`*…and ${candidates.length - CLEANUP_PREVIEW_LIMIT} more*`);
+  }
+  previewLines.push(activeSkip > 0
+    ? `\n*Skipped: ${plural(activeSkip, "channel")} with active sessions, plus this one*`
+    : `\n*Skipped: this channel*`);
+
+  // Token = original interaction id, fits in customId (~19 chars + prefix).
+  const token = cmd.id;
+  pendingCleanups.set(token, {
+    channelIds: candidates.map((c) => c.ch.id),
+    invokerUserId: cmd.user.id,
+    expiresAt: Date.now() + CLEANUP_TTL,
+  });
+  for (const [k, v] of pendingCleanups) {
+    if (v.expiresAt < Date.now()) pendingCleanups.delete(k);
+  }
+
+  const confirm = new ButtonBuilder()
+    .setCustomId(`${ID_PREFIX.CLEANUP_CONFIRM}${token}`)
+    .setLabel(`Delete ${plural(candidates.length, "channel")}`)
+    .setStyle(ButtonStyle.Danger);
+  const cancel = new ButtonBuilder()
+    .setCustomId(`${ID_PREFIX.CLEANUP_CANCEL}${token}`)
+    .setLabel("Cancel")
+    .setStyle(ButtonStyle.Secondary);
+
+  await cmd.reply({
+    embeds: [{
+      title: `🧹 Cleanup preview — ${plural(candidates.length, "channel")}`,
+      description: previewLines.join("\n").slice(0, 4000),
+      color: COLOR.BLURPLE,
+      footer: { text: `Older than ${plural(days, "day")} · expires in 5 min` },
+    }],
+    components: [new ActionRowBuilder<ButtonBuilder>().addComponents(confirm, cancel)],
+    ephemeral: true,
+  });
+}
+
+async function handleCleanupConfirm(interaction: ButtonInteraction, deps: SlashCommandDeps) {
+  const token = interaction.customId.slice(ID_PREFIX.CLEANUP_CONFIRM.length);
+  const pending = pendingCleanups.get(token);
+  if (!pending || pending.expiresAt < Date.now()) {
+    pendingCleanups.delete(token);
+    await interaction.update({
+      content: "⌛ This cleanup request expired. Run `/cleanup` again.",
+      embeds: [],
+      components: [],
+    });
+    return;
+  }
+  if (interaction.user.id !== pending.invokerUserId) {
+    await interaction.reply({ content: "⚠️ Only the invoker can confirm this cleanup.", ephemeral: true });
+    return;
+  }
+  pendingCleanups.delete(token);
+
+  // Re-check active sessions at confirm-time — a session may have spun up
+  // since the preview was rendered.
+  const targets = pending.channelIds.filter((id) => !deps.isChannelActive(id) && id !== deps.channelId);
+
+  await interaction.update({
+    embeds: [cleanupEmbed(0, targets.length, 0, false)],
+    components: [],
+  });
+
+  const guild = interaction.guild;
+  if (!guild) return;
+
+  let deletedCount = 0;
+  let failed = 0;
+  const deleted: string[] = [];
+  for (let i = 0; i < targets.length; i++) {
+    const id = targets[i];
+    // discord.js's REST client serializes deletes through its own rate-limit
+    // queue, so a manual `await sleep` between calls would only stack on top
+    // of that. The library's queue is the right pacing source.
+    const ch = guild.channels.cache.get(id);
+    if (ch) {
+      try {
+        await ch.delete("claude-remote /cleanup");
+        deleted.push(id);
+        deletedCount++;
+      } catch {
+        failed++;
+      }
+    } else {
+      // Already gone — count as success.
+      deleted.push(id);
+      deletedCount++;
+    }
+    if ((i + 1) % CLEANUP_PROGRESS_EVERY === 0 || i === targets.length - 1) {
+      try {
+        await interaction.editReply({ embeds: [cleanupEmbed(deletedCount, targets.length, failed, false)] });
+      } catch { /* best effort */ }
+    }
+  }
+
+  await pruneSessionsFile(deleted);
+
+  await interaction.editReply({ embeds: [cleanupEmbed(deletedCount, targets.length, failed, true)] });
+}
+
+async function handleCleanupCancel(interaction: ButtonInteraction) {
+  const token = interaction.customId.slice(ID_PREFIX.CLEANUP_CANCEL.length);
+  pendingCleanups.delete(token);
+  await interaction.update({
+    content: "❎ Cleanup cancelled.",
+    embeds: [],
+    components: [],
+  });
+}
+
+/** Drop entries from sessions.json whose channelId is in `deletedIds`. The
+ *  file maps Claude session-id → Discord channel-id; orphans hurt nothing
+ *  but it's tidier to clear them out. */
+async function pruneSessionsFile(deletedIds: string[]) {
+  if (deletedIds.length === 0) return;
+  try {
+    const raw = await fsp.readFile(SESSIONS_FILE, "utf-8");
+    const data = JSON.parse(raw) as Record<string, string>;
+    const dead = new Set(deletedIds);
+    let changed = false;
+    for (const [sid, cid] of Object.entries(data)) {
+      if (dead.has(cid)) { delete data[sid]; changed = true; }
+    }
+    if (changed) {
+      await fsp.writeFile(SESSIONS_FILE, JSON.stringify(data, null, 2) + "\n");
+    }
+  } catch { /* file may not exist or be malformed — best effort */ }
 }

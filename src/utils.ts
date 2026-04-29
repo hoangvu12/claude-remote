@@ -52,7 +52,13 @@ export const ID_PREFIX = {
   ELICIT_ACCEPT: "elicit-accept:",
   ELICIT_DECLINE: "elicit-decline:",
   ELICIT_CANCEL: "elicit-cancel:",
+  CLEANUP_CONFIRM: "cleanup-confirm:",
+  CLEANUP_CANCEL: "cleanup-cancel:",
 } as const;
+
+// ── Daemon paths ──
+
+export const SESSIONS_FILE = path.join(CONFIG_DIR, "sessions.json");
 
 // ── Helpers ──
 
@@ -69,6 +75,10 @@ export function encodeProjectPath(projectPath: string): string {
 export function truncate(text: string, maxLen: number, suffix = "…"): string {
   if (text.length <= maxLen) return text;
   return text.slice(0, maxLen - suffix.length) + suffix;
+}
+
+export function plural(n: number, singular: string, pluralForm = singular + "s"): string {
+  return `${n} ${n === 1 ? singular : pluralForm}`;
 }
 
 export function resolveJSONLPath(sessionId: string, cwd: string): string {
